@@ -1,0 +1,72 @@
+# Crash&Learn Grand Prix — Compose services
+#
+# CPU default (all headless):
+#   sim          — smoke test / one-off scripts
+#   tensorboard  — TensorBoard on :6006 (point --logdir at your own training logs)
+#
+# Training: create YOUR OWN train.py, then run it through the sim service:
+#   docker compose run --rm sim python train.py
+#
+# --- sim_recorder + viz_replay ---
+# Record an episode (headless, max speed):
+#   docker compose run --rm recorder
+#   docker compose run --rm recorder python sim_recorder.py --steps 1000 --num-cars 2
+#
+# Replay on host display:
+#   xhost +local:docker
+#   docker compose run --rm replay
+#   docker compose run --rm replay python viz_replay.py --npz /app/episode.npz --follow
+#
+# Quick start:
+#   docker compose run --rm sim             # smoke test (demo.py)
+#   docker compose up  tensorboard          # open http://localhost:6006
+# Shared bind-mount: ./ → /app (live-reloads code changes without rebuild).
+# recordings/ directory is created on first use.
+
+services:
+
+  sim:
+    build:
+      context: .
+      target: base
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      MPLBACKEND: Agg
+    command: python demo.py
+
+  tensorboard:
+    build:
+      context: .
+      target: base
+    volumes:
+      - .:/app
+    working_dir: /app
+    ports:
+      - "6006:6006"
+    command: tensorboard --logdir /app/logs --host 0.0.0.0 --port 6006
+
+  # --- sim_recorder (headless episode recording) ---
+  recorder:
+    build:
+      context: .
+      target: base
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      MPLBACKEND: Agg
+    command: python sim_recorder.py --steps 500 --num-cars 1 --out /app/episode.npz
+
+  # --- viz_replay (top-down replay, headless matplotlib) ---
+  replay:
+    build:
+      context: .
+      target: base
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      MPLBACKEND: Agg
+    command: python viz_replay.py --npz /app/episode.npz
