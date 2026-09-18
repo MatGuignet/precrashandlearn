@@ -51,10 +51,23 @@ class RacingEnv(gym.Env):
     REWARD_TIME_PENALTY = 0.05          # flat cost per decision step
     REWARD_WALL_COLLISION = 0.5         # per step in contact with a wall
     REWARD_VEHICLE_COLLISION = 0.5      # per step in contact with another car
-    REWARD_STEERING_JERK_SCALE = 0.1    # per unit of |normalized steering delta|
+    # Kept small deliberately: this penalty only fires on CHANGE in steering,
+    # so once steering settles on any constant value (including a hard
+    # lock), the penalty drops to exactly 0 forever after — rewarding "never
+    # turn the wheel" regardless of which value it got stuck on. A previous
+    # value of 0.1 was likely strong enough (relative to a still-weak, noisy
+    # progress signal early in training) to make that a genuine local
+    # optimum. Kept nonzero only to still discourage genuine violent zigzag.
+    REWARD_STEERING_JERK_SCALE = 0.02   # per unit of |normalized steering delta|
     REWARD_LAP_COMPLETE = 20.0          # bonus on completing a lap
     REWARD_FINISH = 50.0                # bonus on finishing the race
-    REWARD_DNF = 50.0                   # penalty on stagnation-based DNF / early wall-contact bail-out
+    # Kept well below REWARD_LAP_COMPLETE/REWARD_FINISH so finishing still
+    # dominates, but deliberately NOT so large that it swamps the modest
+    # progress reward a still-learning policy can bank before an early
+    # failure. An earlier value of 50 here made "attempt and partially
+    # progress, then fail" cost more in expectation than "never attempt to
+    # move" — a strong incentive to freeze/reverse rather than explore.
+    REWARD_DNF = 12.0                   # penalty on stagnation-based DNF / early wall-contact bail-out
 
     # Dense wall-avoidance shaping: below this distance (meters) from the
     # nearest LiDAR hit, incur a penalty growing linearly to
@@ -75,7 +88,7 @@ class RacingEnv(gym.Env):
     # bounds that downside to roughly the same order as standing still.
     WALL_CONTACT_DNF_STEPS = 20         # 1s of continuous wall contact @ 20Hz
 
-    def __init__(self, max_episode_steps=4000):
+    def __init__(self, max_episode_steps=6000):
         super().__init__()
 
         self.max_episode_steps = max_episode_steps
@@ -495,7 +508,7 @@ class RacingEnv(gym.Env):
 if __name__ == "__main__":
 
     env = RacingEnv(
-        max_episode_steps=4000
+        max_episode_steps=6000
     )
 
     print("Testing all training maps...\n")

@@ -6,7 +6,13 @@ weather/friction/LiDAR-noise randomization) and exports it to model.onnx.
 
 Usage (inside the provided Docker image, which has torch/sb3/onnx installed):
 
-    docker compose run --rm sim python train.py --timesteps 3000000 --n-envs 8
+    docker compose run --rm sim python train.py --timesteps 3000000 --n-envs 4
+
+n-envs=4 is a practical ceiling, not a tuning choice: env_simulation's parallel
+envs each run in their own subprocess (see make_env() below), and on a
+Docker Desktop VM capped around 4GB RAM, 8 parallel envs reliably OOM-kill a
+subprocess (confirmed: EOFError from SubprocVecEnv.reset() on 8 envs, clean
+run on 4). Raise it only if the container has more memory available.
 
 Why PPO:
     - On-policy: each batch of rollouts is collected under whatever
@@ -60,7 +66,7 @@ from env import RacingEnv
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the Part-1 solo racing PPO agent")
     parser.add_argument("--timesteps", type=int, default=3_000_000, help="Total training timesteps")
-    parser.add_argument("--n-envs", type=int, default=8, help="Parallel environments (see note below)")
+    parser.add_argument("--n-envs", type=int, default=4, help="Parallel environments (see module docstring: 4 is the observed RAM ceiling)")
     parser.add_argument("--logdir", type=str, default="logs", help="TensorBoard + checkpoint directory")
     parser.add_argument("--out", type=str, default="model.onnx", help="Output ONNX path")
     parser.add_argument("--seed", type=int, default=0)
@@ -72,9 +78,13 @@ def parse_args():
              "~1000+ step lap. 0.999 gives ~1000 steps (50s).",
     )
     parser.add_argument(
-        "--ent-coef", type=float, default=0.001,
-        help="Entropy coefficient. 0.005 let the action std drift from ~1.0 to ~1.9 "
-             "over a long run (policy destabilizing instead of converging).",
+        "--ent-coef", type=float, default=0.005,
+        help="Entropy coefficient. Investigated as a suspect when training "
+             "collapsed to a 'reverse away from every corner' local optimum, "
+             "but the actual cause was REWARD_DNF being large enough to make "
+             "a failed forward attempt cost more than never attempting one "
+             "(see env.py's REWARD_DNF comment) - 0.005 trains fine once "
+             "that's fixed. Lower this only if std runs away again.",
     )
     return parser.parse_args()
 
