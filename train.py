@@ -154,7 +154,12 @@ def main():
         model.gamma = args.gamma
         model.rollout_buffer.gamma = args.gamma
         model.ent_coef = args.ent_coef
-        print(f"Resumed with overridden gamma={args.gamma}, ent_coef={args.ent_coef}")
+        # verbose is also restored from the checkpoint (e.g. pretrain_bc.py
+        # used to save with verbose=0) - force it back on so training
+        # progress is actually visible instead of silently running for
+        # however long total_timesteps needs with zero printed output.
+        model.verbose = 1
+        print(f"Resumed with overridden gamma={args.gamma}, ent_coef={args.ent_coef}", flush=True)
     else:
         model = PPO(
             "MlpPolicy",

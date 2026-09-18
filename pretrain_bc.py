@@ -266,7 +266,7 @@ def main():
         policy_kwargs=dict(net_arch=[256, 256]),
         seed=args.seed,
         device="cpu",
-        verbose=0,
+        verbose=1,
     )
 
     print("Behavior-cloning the policy network on the demonstrations...")
