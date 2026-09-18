@@ -3,6 +3,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 import env_simulation
+import features
 
 
 class RacingEnv(gym.Env):
@@ -30,12 +31,49 @@ class RacingEnv(gym.Env):
         "Shanghai",
     ]
 
-    LIDAR_MAX = 15.0
+    # Physical constants, single source of truth in features.py (shared with
+    # agent.py at inference time). Re-exposed here as class attributes so
+    # existing code/tests referencing env.LIDAR_MAX etc. keep working.
+    LIDAR_MAX = features.LIDAR_MAX
+    MIN_SPEED = features.MIN_SPEED
+    MAX_SPEED = features.MAX_SPEED
+    MAX_STEERING = features.MAX_STEERING
 
-    MIN_SPEED = -2.0
-    MAX_SPEED = 10.0
+    # ============================================================
+    # REWARD SHAPING CONSTANTS
+    # ============================================================
+    #
+    # Kept as named class attributes (rather than inline magic numbers)
+    # so they're easy to retune independently without touching the reward
+    # logic itself.
+    #
+    REWARD_PROGRESS_SCALE = 100.0       # per unit of normalized lap progress
+    REWARD_TIME_PENALTY = 0.05          # flat cost per decision step
+    REWARD_WALL_COLLISION = 0.5         # per step in contact with a wall
+    REWARD_VEHICLE_COLLISION = 0.5      # per step in contact with another car
+    REWARD_STEERING_JERK_SCALE = 0.1    # per unit of |normalized steering delta|
+    REWARD_LAP_COMPLETE = 20.0          # bonus on completing a lap
+    REWARD_FINISH = 50.0                # bonus on finishing the race
+    REWARD_DNF = 50.0                   # penalty on stagnation-based DNF / early wall-contact bail-out
 
-    MAX_STEERING = 0.4189
+    # Dense wall-avoidance shaping: below this distance (meters) from the
+    # nearest LiDAR hit, incur a penalty growing linearly to
+    # REWARD_WALL_PROXIMITY_SCALE as the car gets closer to the wall. This
+    # gives a gradient *before* an actual collision happens, instead of
+    # relying only on the sparse REWARD_WALL_COLLISION signal.
+    WALL_PROXIMITY_MARGIN = 0.2         # meters
+    REWARD_WALL_PROXIMITY_SCALE = 0.5
+
+    # A wall collision does NOT by itself end the episode in env_simulation:
+    # a car can stay wedged against a wall, accruing REWARD_WALL_COLLISION
+    # every step, until the stagnation detector eventually fires (up to 80
+    # steps / 4s later) and also applies REWARD_DNF on top. That combination
+    # can make a *failed* attempt to drive cost several times more than
+    # never attempting to move in the first place (bail out fast, pay
+    # REWARD_DNF once) — a strong incentive to freeze rather than explore.
+    # Bailing out ourselves after a short streak of continuous wall contact
+    # bounds that downside to roughly the same order as standing still.
+    WALL_CONTACT_DNF_STEPS = 20         # 1s of continuous wall contact @ 20Hz
 
     def __init__(self, max_episode_steps=4000):
         super().__init__()
@@ -45,6 +83,7 @@ class RacingEnv(gym.Env):
         self.step_count = 0
         self.previous_steering = 0.0
         self.current_map = None
+        self.wall_contact_streak = 0
 
         # ============================================================
         # ACTION SPACE
@@ -88,29 +127,12 @@ class RacingEnv(gym.Env):
         # progress:
         #   [0, 1]
         #
-        low = np.concatenate(
-            [
-                np.zeros(100, dtype=np.float32),
-                np.array(
-                    [-0.2, -1.0, 0.0],
-                    dtype=np.float32,
-                ),
-            ]
-        )
-
-        high = np.concatenate(
-            [
-                np.ones(100, dtype=np.float32),
-                np.array(
-                    [1.0, 1.0, 1.0],
-                    dtype=np.float32,
-                ),
-            ]
-        )
-
+        # Bounds live in features.py (single source of truth, shared with
+        # agent.py at inference time).
+        #
         self.observation_space = spaces.Box(
-            low=low,
-            high=high,
+            low=features.OBS_LOW,
+            high=features.OBS_HIGH,
             dtype=np.float32,
         )
 
@@ -125,165 +147,31 @@ class RacingEnv(gym.Env):
         return self.np_random.choice(self.MAPS)
 
     # ==================================================================
-    # OBSERVATION PREPROCESSING
+    # OBSERVATION / ACTION PREPROCESSING
     # ==================================================================
-
-    def _get_observation(self, obs):
-        """
-        Convert the raw simulation observation into the 103-dimensional
-        normalized observation used by the RL agent.
-        """
-
-        # --------------------------------------------------------------
-        # LiDAR
-        # --------------------------------------------------------------
-        #
-        # Raw range: [0.1, 15]
-        # Normalized range: [0, 1]
-        #
-        lidar = np.asarray(
-            obs["lidar"],
-            dtype=np.float32,
-        )
-
-        lidar = np.clip(
-            lidar / self.LIDAR_MAX,
-            0.0,
-            1.0,
-        )
-
-        # --------------------------------------------------------------
-        # Velocity
-        # --------------------------------------------------------------
-        #
-        # Physical range:
-        #   [-2, 10] m/s
-        #
-        # We normalize by MAX_SPEED = 10.
-        #
-        velocity = np.float32(
-            np.clip(
-                obs["velocity"] / self.MAX_SPEED,
-                -0.2,
-                1.0,
-            )
-        )
-
-        # --------------------------------------------------------------
-        # Steering
-        # --------------------------------------------------------------
-
-        steering = np.float32(
-            np.clip(
-                obs["steering"] / self.MAX_STEERING,
-                -1.0,
-                1.0,
-            )
-        )
-
-        # --------------------------------------------------------------
-        # Progress
-        # --------------------------------------------------------------
-
-        progress = np.float32(
-            np.clip(
-                obs["progress"],
-                0.0,
-                1.0,
-            )
-        )
-
-        # --------------------------------------------------------------
-        # Final observation
-        # --------------------------------------------------------------
-
-        observation = np.concatenate(
-            [
-                lidar,
-                np.array(
-                    [
-                        velocity,
-                        steering,
-                        progress,
-                    ],
-                    dtype=np.float32,
-                ),
-            ]
-        )
-
-        return observation.astype(np.float32)
-
-    # ==================================================================
-    # ACTION PREPROCESSING
-    # ==================================================================
-
-    def _action_to_physical(self, action):
-        """
-        Convert the normalized RL action [-1, 1] into the physical
-        simulation action.
-
-        Input:
-            action[0] = normalized target speed
-            action[1] = normalized steering
-
-        Output:
-            target_speed in [-2, 10] m/s
-            steering in [-0.4189, 0.4189] rad
-        """
-
-        action = np.asarray(
-            action,
-            dtype=np.float32,
-        )
-
-        action = np.clip(
-            action,
-            -1.0,
-            1.0,
-        )
-
-        normalized_speed = action[0]
-        normalized_steering = action[1]
-
-        # Map [-1, 1] -> [-2, 10]
-        target_speed = (
-            self.MIN_SPEED
-            + (
-                (normalized_speed + 1.0)
-                * (self.MAX_SPEED - self.MIN_SPEED)
-                / 2.0
-            )
-        )
-
-        # Map [-1, 1] -> [-0.4189, 0.4189]
-        steering = (
-            normalized_steering
-            * self.MAX_STEERING
-        )
-
-        return (
-            float(target_speed),
-            float(steering),
-        )
+    #
+    # Delegated to features.py, the pure-numpy module shared with agent.py.
+    # See features.build_observation() and features.action_to_physical().
 
     # ==================================================================
     # REWARD
     # ==================================================================
 
-    def _compute_reward(self, step_info, current_steering):
+    def _compute_reward(self, step_info, raw_lidar, normalized_steering, forced_dnf=False):
         """
         Compute the reward for one simulation decision step.
 
-        Current reward:
+        Components (see REWARD_* class constants for the exact weights):
 
-            +100 * progress_delta
-            -0.05 time penalty
-            -2 wall collision
-            -2 vehicle collision
-            -0.05 steering variation
-            +20 completed lap
-            +50 finish
-            -50 DNF
+            + progress reward               (main objective)
+            - flat time penalty             (discourage crawling)
+            - dense wall-proximity penalty  (anticipate collisions)
+            - wall collision penalty
+            - vehicle collision penalty
+            - steering-jerk penalty         (smooth driving)
+            + lap-complete bonus
+            + finish bonus
+            - DNF penalty (stagnation, or forced_dnf: a wall-contact bail-out)
         """
 
         agent_id = 0
@@ -313,16 +201,35 @@ class RacingEnv(gym.Env):
         )
 
         finished = status == 2
-        dnf = status == 0
+        dnf = status == 0 or forced_dnf
 
         # --------------------------------------------------------------
-        # Steering smoothness
+        # Steering smoothness (normalized action units, scale-independent
+        # of MAX_STEERING)
         # --------------------------------------------------------------
 
-        steering_change = abs(
-            current_steering
+        steering_jerk = abs(
+            normalized_steering
             - self.previous_steering
         )
+
+        # --------------------------------------------------------------
+        # Dense wall-proximity shaping
+        # --------------------------------------------------------------
+        #
+        # A sparse collision penalty only fires once contact already
+        # happened. Adding a continuous penalty as the car gets close to
+        # a wall gives the policy an earlier gradient to steer away,
+        # instead of learning to avoid walls purely from crash events.
+        #
+        min_wall_dist = float(np.min(raw_lidar))
+
+        proximity_penalty = 0.0
+        if min_wall_dist < self.WALL_PROXIMITY_MARGIN:
+            proximity_penalty = self.REWARD_WALL_PROXIMITY_SCALE * (
+                (self.WALL_PROXIMITY_MARGIN - min_wall_dist)
+                / self.WALL_PROXIMITY_MARGIN
+            )
 
         # --------------------------------------------------------------
         # Reward
@@ -331,36 +238,39 @@ class RacingEnv(gym.Env):
         reward = 0.0
 
         # Main objective: make progress
-        reward += 100.0 * progress_delta
+        reward += self.REWARD_PROGRESS_SCALE * progress_delta
 
         # Small time penalty
-        reward -= 0.05
+        reward -= self.REWARD_TIME_PENALTY
+
+        # Anticipate walls before actually hitting them
+        reward -= proximity_penalty
 
         # Avoid walls
         if wall_collision:
-            reward -= 2.0
+            reward -= self.REWARD_WALL_COLLISION
 
         # Avoid other vehicles
         if vehicle_collision:
-            reward -= 2.0
+            reward -= self.REWARD_VEHICLE_COLLISION
 
         # Encourage smooth steering
-        reward -= 0.05 * steering_change
+        reward -= self.REWARD_STEERING_JERK_SCALE * steering_jerk
 
         # Lap completed
         if lap_complete:
-            reward += 20.0
+            reward += self.REWARD_LAP_COMPLETE
 
         # Race finished
         if finished:
-            reward += 50.0
+            reward += self.REWARD_FINISH
 
         # DNF / stagnation
         if dnf:
-            reward -= 50.0
+            reward -= self.REWARD_DNF
 
         # Store steering for the next step
-        self.previous_steering = current_steering
+        self.previous_steering = normalized_steering
 
         return float(reward)
 
@@ -388,6 +298,7 @@ class RacingEnv(gym.Env):
 
         self.step_count = 0
         self.previous_steering = 0.0
+        self.wall_contact_streak = 0
 
         # --------------------------------------------------------------
         # Select map
@@ -427,7 +338,7 @@ class RacingEnv(gym.Env):
 
         step_info = env_simulation.get_step_info()
 
-        observation = self._get_observation(
+        observation = features.build_observation(
             raw_obs
         )
 
@@ -457,8 +368,14 @@ class RacingEnv(gym.Env):
         # Convert normalized action to physical action
         # --------------------------------------------------------------
 
-        target_speed, steering = self._action_to_physical(
-            action
+        normalized_action = np.clip(
+            np.asarray(action, dtype=np.float32),
+            -1.0,
+            1.0,
+        )
+
+        target_speed, steering = features.action_to_physical(
+            normalized_action
         )
 
         # --------------------------------------------------------------
@@ -485,22 +402,39 @@ class RacingEnv(gym.Env):
 
         step_info = env_simulation.get_step_info()
 
+        raw_obs = env_simulation.get_obs(0)
+
+        # --------------------------------------------------------------
+        # Wall-contact streak (see WALL_CONTACT_DNF_STEPS docstring)
+        # --------------------------------------------------------------
+
+        wall_collision_now = bool(
+            step_info["collisions"]["wall"][0]
+        )
+
+        if wall_collision_now:
+            self.wall_contact_streak += 1
+        else:
+            self.wall_contact_streak = 0
+
+        forced_dnf = self.wall_contact_streak >= self.WALL_CONTACT_DNF_STEPS
+
         # --------------------------------------------------------------
         # Reward
         # --------------------------------------------------------------
 
         reward = self._compute_reward(
             step_info,
-            steering,
+            raw_obs["lidar"],
+            float(normalized_action[1]),
+            forced_dnf,
         )
 
         # --------------------------------------------------------------
         # Observation
         # --------------------------------------------------------------
 
-        raw_obs = env_simulation.get_obs(0)
-
-        observation = self._get_observation(
+        observation = features.build_observation(
             raw_obs
         )
 
@@ -516,7 +450,7 @@ class RacingEnv(gym.Env):
         #   0 = DNF
         #   1 = active
         #   2 = finished
-        terminated = status in (0, 2)
+        terminated = status in (0, 2) or forced_dnf
 
         # Gymnasium truncation is used for our own timeout.
         truncated = (
