@@ -55,12 +55,86 @@ sys.modules.setdefault("gym", gymnasium)
 
 import torch as th
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, CallbackList
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from env import RacingEnv
+
+
+class BestModelCallback(BaseCallback):
+    """Track and save the best-performing checkpoint across training.
+
+    PPO fine-tuning over many millions of steps does NOT improve
+    monotonically: two long unsupervised runs this project drifted from a
+    genuinely good multi-map policy into a much worse one (collisions and
+    stalls reappearing on some maps) well before total_timesteps was
+    reached, and only manual post-hoc bisection through CheckpointCallback's
+    snapshots recovered the good state. This automates that safety net: every
+    `eval_freq` steps, run one deterministic rollout per training map (the
+    same check used throughout this project's debugging) and keep the
+    highest-scoring snapshot as `best_model.zip`, independent of whatever
+    state training happens to be in when it eventually stops.
+    """
+
+    def __init__(self, eval_freq: int, save_path: str, verbose: int = 1):
+        super().__init__(verbose)
+        self.eval_freq = eval_freq
+        self.save_path = save_path
+        self.best_score = -float("inf")
+        self._eval_env = None
+        self._last_eval_at = 0
+
+    def _on_training_start(self) -> None:
+        self._eval_env = RacingEnv()
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last_eval_at >= self.eval_freq:
+            self._last_eval_at = self.num_timesteps
+            self._evaluate()
+        return True
+
+    def _evaluate(self) -> None:
+        finished = 0
+        total_progress = 0.0
+        total_wall_hits = 0
+
+        for map_name in self._eval_env.MAPS:
+            obs, info = self._eval_env.reset(options={"map_name": map_name})
+            wall_hits = 0
+            max_progress = 0.0
+            for _ in range(6000):
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, _reward, terminated, truncated, info = self._eval_env.step(action)
+                sim = info["simulation"]
+                wall_hits += int(sim["collisions"]["wall"][0])
+                max_progress = max(max_progress, sim["max_progress"][0])
+                if terminated or truncated:
+                    break
+            if info["status"] == 2:
+                finished += 1
+            total_progress += max_progress
+            total_wall_hits += wall_hits
+
+        avg_progress = total_progress / len(self._eval_env.MAPS)
+        # Finishing a map dominates the score; collisions are a tie-breaking
+        # penalty. Weights are deliberately coarse - this only needs to rank
+        # snapshots relative to each other, not produce a calibrated metric.
+        score = finished * 100 + avg_progress * 10 - total_wall_hits * 0.1
+
+        print(
+            f"[BestModelCallback] step={self.num_timesteps} finished={finished}/5 "
+            f"avg_progress={avg_progress:.3f} wall_hits={total_wall_hits} "
+            f"score={score:.2f} (best={self.best_score:.2f})",
+            flush=True,
+        )
+
+        if score > self.best_score:
+            self.best_score = score
+            path = os.path.join(self.save_path, "best_model")
+            self.model.save(path)
+            print(f"[BestModelCallback] new best - saved to {path}.zip", flush=True)
 
 
 def parse_args():
@@ -71,6 +145,13 @@ def parse_args():
     parser.add_argument("--out", type=str, default="model.onnx", help="Output ONNX path")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", type=str, default=None, help="Path to a .zip checkpoint to resume from")
+    parser.add_argument(
+        "--eval-freq", type=int, default=100_000,
+        help="Timesteps between BestModelCallback evaluations (5-map deterministic "
+             "rollout). Saves logdir/best_model.zip whenever the score improves, so "
+             "a long run's eventual drift/regression never costs the best state "
+             "actually reached.",
+    )
     parser.add_argument(
         "--gamma", type=float, default=0.999,
         help="Discount factor. At 20Hz decision rate, gamma=0.99 gives an effective "
@@ -184,15 +265,44 @@ def main():
         save_path=os.path.join(args.logdir, "checkpoints"),
         name_prefix="ppo_racing",
     )
+    best_model_callback = BestModelCallback(
+        eval_freq=args.eval_freq,
+        save_path=args.logdir,
+    )
 
     model.learn(
         total_timesteps=args.timesteps,
-        callback=checkpoint_callback,
+        callback=CallbackList([checkpoint_callback, best_model_callback]),
         reset_num_timesteps=args.resume is None,
     )
 
     model.save(os.path.join(args.logdir, "ppo_racing_final"))
-    export_onnx(model, args.out)
+
+    # The final-step model is NOT necessarily the best one reached (PPO does
+    # not improve monotonically over long runs - see BestModelCallback). Export
+    # whichever is best according to the 5-map eval, falling back to the final
+    # model only if BestModelCallback never ran (e.g. a very short --timesteps).
+    best_model_path = os.path.join(args.logdir, "best_model.zip")
+    if os.path.exists(best_model_path):
+        print(f"Exporting best_model.zip (score={best_model_callback.best_score:.2f}), "
+              f"not the final-step model, as {args.out}", flush=True)
+        try:
+            export_onnx(PPO.load(best_model_path, device="cpu"), args.out)
+        except Exception as e:
+            # Loading a second checkpoint in this same process has, once,
+            # hit a flaky torch lazy-import error unrelated to this script's
+            # own logic (reproduced independent of it, see project notes).
+            # Don't let that crash the whole training run at the very last
+            # step - fall back to exporting the in-memory final model, and
+            # leave best_model.zip on disk to export by hand if it matters:
+            #   python -c "from stable_baselines3 import PPO; ..." (no gym
+            #   namespace workaround in that one-off process).
+            print(f"WARNING: could not load/export best_model.zip ({e}). "
+                  f"Exporting the final-step model instead; best_model.zip "
+                  f"is still on disk at {best_model_path} for manual export.", flush=True)
+            export_onnx(model, args.out)
+    else:
+        export_onnx(model, args.out)
 
     env.close()
 

@@ -50,8 +50,8 @@ from f110_gym.envs.laser_models import ScanSimulator2D
 _FREQ_HZ           = 100         # physics sub-step rate (Hz)
 _DECISION_FREQ_HZ  = 20          # control / bookkeeping rate (Hz)
 _PHYSICS_STEPS     = 5           # sub-steps per decision step
-_FRICTION_LO       = 0.99        # minimum surface friction (engine mu) 1=sunny, 0.5=heavy rain
-_FRICTION_HI       = 1.0         # maximum surface friction
+_FRICTION_LO       = 0.7         # minimum surface friction (engine mu): worst downpour per project spec
+_FRICTION_HI       = 1.0         # maximum surface friction: sunny/dry
 _FRICTION_INTERVAL_SEC = (20, 20)  # FIXED 20 s between friction changes (matches lore)
 _DNF_WINDOW_SEC    = 4.0         # stagnation detection window (s)
 _TARGET_SPEED_MIN  = -2.0        # wrapper action bound (engine v_min is lower)
@@ -60,7 +60,8 @@ _VEL_OBS_MIN       = -2.0        # observation contract bound for velocity
 _VEL_OBS_MAX       = 10.0        # observation contract bound for velocity
 _LIDAR_RAYS        = 100         # beam count (class-var override after every build)
 _LIDAR_FOV         = 2.0 * math.pi  # 360-degree full field of view (rad)
-_LIDAR_NOISE       = 0.001       # multiplicative uniform noise half-range (up to 0.05/±5% in extreme weather)
+_LIDAR_NOISE_LO    = 0.001       # multiplicative uniform noise half-range: sunny/dry
+_LIDAR_NOISE_HI    = 0.1         # multiplicative uniform noise half-range: worst downpour per project spec
 _LIDAR_MIN         = 0.1         # clip min (m)
 _LIDAR_MAX         = 15.0        # clip max (m)
 _TTC_THRESH        = 0.015       # iTTC detection window (1.5 x dt at 100 Hz)
@@ -665,15 +666,34 @@ class _Sim:
         #          self._max_progress
         self._update_stagnation_and_dnf()
 
-        # Generate deterministic LiDAR noise once per step (reused by get_obs)
-        self._last_scan_noise = self._rng.uniform(-_LIDAR_NOISE, _LIDAR_NOISE, size=_LIDAR_RAYS)
+        # Generate deterministic LiDAR noise once per step (reused by get_obs).
+        # Noise magnitude tracks the current friction on the same sunny->downpour
+        # axis: _FRICTION_HI (1.0, sunny) -> _LIDAR_NOISE_LO, _FRICTION_LO (0.7,
+        # worst downpour) -> _LIDAR_NOISE_HI, linearly in between.
+        friction_span = _FRICTION_HI - _FRICTION_LO
+        weather_t = (_FRICTION_HI - self._friction) / friction_span if friction_span > 0 else 0.0
+        weather_t = float(np.clip(weather_t, 0.0, 1.0))
+        current_lidar_noise = _LIDAR_NOISE_LO + weather_t * (_LIDAR_NOISE_HI - _LIDAR_NOISE_LO)
+        self._last_scan_noise = self._rng.uniform(-current_lidar_noise, current_lidar_noise, size=_LIDAR_RAYS)
 
     # ------------------------------------------------------------------
     # Friction
     # ------------------------------------------------------------------
     def _update_friction(self) -> None:
+        # FIX C-weather: this used to build `p` and never apply or store it -
+        # self._friction was set once at reset() and never touched again, so
+        # the whole friction-randomization scaffolding below (_FRICTION_LO,
+        # _friction_countdown, _next_friction_steps) was dead code and every
+        # episode silently ran at _FRICTION_HI (sunny) regardless of range.
+        self._friction_countdown -= 1
+        if self._friction_countdown > 0:
+            return
+
+        self._friction = float(self._rng.uniform(_FRICTION_LO, _FRICTION_HI))
         p = dict(_PARAMS)
-        p["mu"] = _FRICTION_HI
+        p["mu"] = self._friction
+        self._sim.update_params(p, agent_idx=-1)
+        self._friction_countdown = self._next_friction_steps()
 
 
     # ------------------------------------------------------------------
