@@ -11,3 +11,5 @@ logs_*/
 *.onnx.data
 *.zip
 CrashAndLearn-project.pdf
+OldLog/
+License

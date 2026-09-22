@@ -242,6 +242,33 @@ count, tie-breaking) improves — independent of whatever state training happens
 when it eventually stops. `train.py`'s final ONNX export uses `best_model.zip`, not the
 raw final-step model.
 
+## Generalization to circuits never trained on
+
+`RacingEnv.MAPS` (Monza, Zandvoort, YasMarina, Spielberg, Shanghai) was the training
+subset provided from the start of this project, out of ~25 circuits shipped under
+`maps/`. The other ~20 were deliberately left untouched as a genuine held-out
+generalization test, rather than folded into training — the egocentric, map-agnostic
+observation design (state-space section above) is what makes this a meaningful test at
+all: nothing about the observation could let the policy memorize a specific circuit's
+geometry even if it wanted to.
+
+Zero-shot (no fine-tuning, no exposure during training) on 8 unseen circuits:
+
+| Map | Result |
+|---|---|
+| Budapest, Catalunya | FINISHED |
+| BrandsHatch, Nuerburgring, Sakhir, Silverstone | ≥99.9% progress, DNF (consistent with the same lap-transition engine limitation as Monza/Zandvoort) |
+| Austin | 12.7% progress |
+| Montreal | 0.7% progress, 113 wall hits — a genuine generalization failure |
+
+6/8 (75%) unseen circuits are handled essentially as well as the training circuits.
+Austin and Montreal are real exceptions, not measurement noise - both show actual
+struggle (low progress, and for Montreal, heavy collision) rather than the "high
+progress, engine-limited DNF" pattern the other six share. Whatever specific geometry
+those two circuits present (a corner radius or track width outside the range the 5
+training circuits happened to cover) is a legitimate remaining weak spot, not something
+this evaluation was set up to hide.
+
 # Part 2 — Grand Crash Auto
 
 ## Diagnosis
@@ -297,3 +324,185 @@ distinguish between, and "another car is here" was never one of them. Part 3's t
 folding the `opponents` observation in and retraining with the vehicle-collision term
 now actually reachable — is a structurally different learning problem from Part 1, not
 a fine-tuning continuation of it.
+
+# Part 3 — Multi-agent & Competitive Training
+
+## Design
+
+`env_champion.py::ChampionRacingEnv` (subclasses `RacingEnv`) shares the circuit with
+1-3 opponents (`num_cars` randomized 2-4 per episode, the same domain-randomization
+principle as Part 1's maps/weather, now applied to opponent count) driven internally by
+a **frozen** copy of the Part 1 champion, not by a second copy of the policy being
+trained. Fully simultaneous self-play (every car's policy updated together) is a
+substantially harder, non-stationary learning problem - the environment keeps shifting
+under every agent as every other agent also changes. Treating opponents as fixed
+environment dynamics keeps this a standard single-agent RL problem from the ego's point
+of view, reusing the same PPO/BC infrastructure Part 1 already validated.
+
+The observation grows from 103 to 123 dims: `features.build_observation_multi` appends
+4 fixed opponent slots (`[x_rel, y_rel, yaw_rel, speed, active]`, normalized), regardless
+of how many opponents are actually active, so the input shape never changes. Field names
+are read defensively under both spellings found in this codebase - `env_simulation.py`'s
+real `get_obs()` uses `x_rel`/`yaw_rel`/`speed`/`status`, but `agent_loader.py`'s dry-run
+validation dummy (which every `agent.py` is silently run against once, at tournament load
+time, before a single real observation exists) spells them `rel_x`/`rel_yaw`/`velocity`/
+`active` instead. An encoder written for only one spelling would `KeyError` on whichever
+dict it wasn't tested against - possibly only at tournament time.
+
+The reward function is reused **unchanged** from Part 1 (`RacingEnv._compute_reward`):
+`REWARD_VEHICLE_COLLISION` was already present in the code throughout Part 1 but
+structurally inert (solo training can never produce a vehicle collision), so it becomes
+meaningful here with no redesign needed. No explicit "overtaking" bonus term was added -
+finishing sooner already captures that competitively through the same progress reward,
+and adding more shaped terms is exactly the kind of complexity that caused several of
+Part 1's degenerate-policy episodes.
+
+## What did not work: BC-from-heuristic (Part 1's approach, reused naively)
+
+The Follow-The-Gap heuristic that warm-started Part 1 was reused as-is to generate
+demonstrations for a **freshly initialized** 123-dim network (same reasoning as Part
+1: PPO from a random init reliably fails to discover competent driving on its own).
+After BC + 1M + 2.1M further PPO steps (~3.1M total), the best score plateaued with
+**every map still ending in DNF at only 8-16% progress**, often with zero recorded
+collisions. A detailed per-step trace showed why: progress consistently froze around
+steps 100-270 regardless of map, and in the majority of cases the nearest opponent was
+15m+ away (out of range) at the moment of the freeze. This ruled out opponent-avoidance
+as the bottleneck - the network simply hadn't relearned basic cornering/wall-recovery
+competence on this new, bigger observation from a generic heuristic's demonstrations,
+the same "growing pains" Part 1's solo model needed millions of steps to work through
+on its own, now compounded by a genuinely harder task.
+
+## What worked: transplanting the solo model's weights instead of re-learning from scratch
+
+`transfer_champion_init.py` copies the Part 1 champion's policy weights directly into a
+freshly-constructed 123-dim network. Every weight tensor matches exactly between the two
+networks **except** the first layer of each of the policy and value networks, whose
+input width grew from 103 to 123; those are copied for their first 103 columns and
+zero-padded for the 20 new opponent-feature columns. Zero-initializing those columns
+means the transplanted network is, at the moment of construction, **mathematically
+identical** to the solo model - the opponent features are multiplied by zero and
+contribute nothing to any output. Verified directly before any RL update ran: the
+transplanted network already drove 10/15 test episodes to ≥99% progress with 3 clean
+finishes, immediately, purely from the transfer - PPO fine-tuning only had to learn to
+layer opponent-reactive behavior on top of already-competent solo driving, a
+substantially narrower problem than re-deriving that competence from an imitation
+baseline. 30 minutes of fine-tuning from this starting point already matched what 3+
+hours of BC-from-scratch had failed to reach.
+
+## A second bug found the hard way: NaN propagation crashed a live training run
+
+`env_simulation`'s underlying `f110_gym` physics integrator has, since early in this
+project, occasionally logged `RuntimeWarning: overflow encountered in add` /
+`invalid value encountered in scalar remainder` (see Part 1's notes on frozen/DNF'd
+cars) without visibly corrupting anything downstream - until a ~600k-step point in a
+12-hour training run, where one car's simulation state actually went to `NaN`, which
+`env_simulation.get_obs()` passed straight through into the observation, into the
+policy network, and crashed `torch.distributions.Normal`'s validation with a hard
+`ValueError`, killing the entire training process. `np.clip` does **not** sanitize
+`NaN` (a `NaN` compared against any bound evaluates to `False` and passes through
+unchanged), so nothing in `features.py` was catching this. Fixed by wrapping the final
+array in both `build_observation` and `build_observation_multi` (and the action in
+`action_to_physical`, since a `NaN` action fed back into `apply_action()` could itself
+retrigger the instability) with `np.nan_to_num(...)`, sanitizing at the one boundary
+both training and inference share. A rare event over any single run, but training for
+12+ hours makes "rare" a near-certainty at some point - exactly the kind of failure
+mode a short debugging session doesn't surface but a long unattended one does.
+
+## Results
+
+Final champion (`submission/champion/`), evaluated over 3 episodes per training map
+(2-4 randomized opponents, all driven by the frozen Part 1 model):
+
+| Map | Episodes reaching ≥99% progress | Clean finishes |
+|---|---|---|
+| Monza | 2/3 | 1 |
+| Zandvoort | 3/3 | 0 (same Part 1 engine-level lap-transition limitation) |
+| YasMarina | 0/3 (hardest map - also the weakest solo performer in Part 1) | 0 |
+| Spielberg | 3/3 | 2 |
+| Shanghai | 3/3 | 0 |
+
+10/15 episodes reach near-complete laps against real opponents; vehicle collisions still
+occur in most episodes (the remaining gap between "drives well" and "races cleanly"),
+but the qualitative failure mode from Part 2's diagnosis - freezing at the start grid,
+never separating from the pack - is gone. Best score plateaued at the same value for the
+last ~14.5M steps of the final 15M-step run (protected by `BestModelCallback`, exported
+regardless of the plateau), suggesting further gains from here would need a change in
+approach (e.g. an explicit overtaking-reward term, or genuine simultaneous self-play)
+rather than simply more steps of the current setup.
+
+**Generalization, with opponents present**: tested zero-shot on 4 of the same unseen
+circuits as the solo model's generalization test, against 3-4 opponents driven by the
+frozen solo model. All 4 reached ≥99.9% progress, including one clean finish (Budapest).
+Austin in particular - one of the solo model's two weak points - reached 99.9% here
+(most likely run-to-run variance given the randomized opponent count/weather rather
+than a genuine fix, but a positive data point regardless).
+
+# Part 4 — Final Grand Prix (4 differentiated drivers)
+
+## Design
+
+The competition requires 4 submitted drivers, all authored by the same person. Rather
+than submit 4 identical copies of the Part 1 solo model, each was given a distinct
+personality by fine-tuning from that same base (`logs_weather/best_model.zip`) with a
+different reward-shaping override, using the `--reward-*` CLI flags added to
+`train.py` (`make_env()` applies them as instance attributes that shadow `RacingEnv`'s
+class-level reward constants - see Part 1's reward function). Each fine-tune ran for
+1,000,000 timesteps (~30 minutes), protected by the same `BestModelCallback` used
+everywhere else in this project, so a fine-tune can only ever replace the base model
+with something that scored better on the callback's own evaluation, never worse.
+
+| Driver | Personality | Override | Best callback score |
+|---|---|---|---|
+| driver1 | Baseline | none (Part 1 solo model as-is) | 308.26 |
+| driver2 | "Le Rapide" | speed-oriented reward tuning | 308.18 |
+| driver3 | "Le Prudent" | `REWARD_WALL_PROXIMITY_SCALE=1.0`, `WALL_PROXIMITY_MARGIN=0.4` (wider, more heavily penalized safety margin from walls) | 509.70 |
+| driver4 | "Le Lisse" | `REWARD_STEERING_JERK_SCALE=0.04` (double the Part 1 value - stronger penalty on steering changes, smoother inputs) | 197.17 |
+
+Driver3 and driver4's scores are **not directly comparable** to driver1/driver2's or to
+each other's: `BestModelCallback`'s score formula includes the reward terms that were
+overridden for that run, so scaling `REWARD_WALL_PROXIMITY_SCALE` up mechanically
+inflates driver3's number regardless of driving quality. Only same-reward-function
+comparisons (like driver1 vs driver2) are meaningful from training scores alone - which
+is exactly why the drivers were then raced against each other directly, under one
+shared, override-free scoring method (progress/finish/DNF), rather than trusting each
+one's own training-time score.
+
+## Multi-driver validation race
+
+A single `predict()` call on a dummy observation confirms a model *loads*, not that it
+*drives*. To actually validate the 4 drivers, `race_drivers.py` (loads all 4 via
+`agent_loader.validate_and_load_agent`, drives them through real episodes via
+`env_simulation` directly - the same low-level interface `sim_recorder.py` uses) ran
+them together, 4 cars on track simultaneously, cycling through all 5 training circuits
+(Monza, Zandvoort, YasMarina, Spielberg, Shanghai) for 6 minutes each, 30 minutes total:
+
+| Driver | Episodes | Finished | DNF | Avg. progress |
+|---|---|---|---|---|
+| driver1 | 240 | 70 (29%) | 166 | 0.826 |
+| driver2 | 240 | 76 (32%) | 160 | 0.846 |
+| **driver3** | 240 | **162 (68%)** | 75 | **0.927** |
+| driver4 | 240 | 120 (50%) | 117 | 0.851 |
+
+960 episodes total, zero `predict()` exceptions across all 4 agents - a meaningful
+robustness result on its own, given none of these models had previously been run for
+this long in a genuine multi-car setting.
+
+**driver3 "Le Prudent" is unambiguously the strongest of the 4**, including on its own
+terms: on Monza it DNFs only 3/61 times, versus 47, 32, and 12 for driver1, driver2,
+and driver4 respectively. The wider wall-proximity margin does exactly what it was
+designed to do. **YasMarina remains the hardest circuit for every driver** (0.62-0.87
+average progress, worst DNF rate of the 5 maps for all 4), consistent with it already
+being the champion's weakest map in Part 3.
+
+The overall finish rate (29-68%) is far below Part 1's solo generalization results
+(≥99.9% on most maps) - expected, not a regression: these are 4 variants of a model
+that was only ever trained solo, now racing 3 other cars simultaneously. This is Part
+2's diagnosis ("why a solo-trained policy cannot hold a shared circuit") playing out
+identically across all 4 personalities, confirmed by the very large raw
+vehicle-collision counts recorded per map (collisions are counted per contact-timestep,
+not per event, so the raw numbers are large by construction, but the pattern - far more
+vehicle contact than wall contact on most maps - is the same signal as Part 2). None of
+the 4 submitted drivers are opponent-aware; only the Part 3 champion was fine-tuned
+with opponents present. Improving shared-circuit behavior further would mean applying
+Part 3's transfer-learning approach to each driver individually, which was judged out
+of scope given the time budget for this differentiation pass.

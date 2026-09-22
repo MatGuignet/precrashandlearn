@@ -74,7 +74,15 @@ def build_observation(raw_obs: dict) -> np.ndarray:
         [lidar, np.array([velocity, steering, progress], dtype=np.float32)]
     )
 
-    return observation.astype(np.float32)
+    # np.clip does NOT sanitize NaN (NaN compared to any bound is False, so
+    # it passes through unchanged). The underlying f110_gym physics
+    # integrator occasionally produces a NaN car state under extreme
+    # conditions (confirmed: crashed a live 15M-step training run at
+    # ~600k steps by propagating into the policy's action distribution and
+    # raising inside torch.distributions.Normal). Sanitizing here, once, at
+    # the training/inference boundary both worlds share, is cheap insurance
+    # against that ever taking down a training run or an agent.py again.
+    return np.nan_to_num(observation, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
 
 
 # ==========================================================================
@@ -123,10 +131,11 @@ def _encode_opponent(opp: dict) -> np.ndarray:
 def build_observation_multi(raw_obs: dict) -> np.ndarray:
     """Like build_observation(), plus 4 fixed opponent slots (Part 3 champion)."""
 
-    base = build_observation(raw_obs)
+    base = build_observation(raw_obs)  # already NaN/Inf-sanitized
     opponents = raw_obs.get("opponents", {})
     slots = [_encode_opponent(opponents.get(i, {})) for i in range(N_OPPONENT_SLOTS)]
-    return np.concatenate([base] + slots).astype(np.float32)
+    observation = np.concatenate([base] + slots)
+    return np.nan_to_num(observation, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
 
 
 def action_to_physical(action) -> tuple[float, float]:
@@ -134,7 +143,11 @@ def action_to_physical(action) -> tuple[float, float]:
     action (target_speed in m/s, steering in rad).
     """
 
-    action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+    # Sanitize before clipping (np.clip does not touch NaN) - a NaN action
+    # fed into env_simulation.apply_action() could itself trigger the very
+    # physics-integrator instability this is meant to guard against.
+    action = np.nan_to_num(np.asarray(action, dtype=np.float32), nan=0.0, posinf=1.0, neginf=-1.0)
+    action = np.clip(action, -1.0, 1.0)
 
     normalized_speed = float(action[0])
     normalized_steering = float(action[1])

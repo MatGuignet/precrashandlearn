@@ -167,17 +167,39 @@ def parse_args():
              "(see env.py's REWARD_DNF comment) - 0.005 trains fine once "
              "that's fixed. Lower this only if std runs away again.",
     )
+    parser.add_argument(
+        "--reward-progress-scale", type=float, default=None,
+        help="Override RacingEnv.REWARD_PROGRESS_SCALE (default 100.0). Higher "
+             "rewards raw speed/progress more relative to caution - used to give "
+             "the 4 submission drivers distinct personalities without retraining "
+             "from scratch (fine-tune from a shared base instead).",
+    )
+    parser.add_argument(
+        "--reward-wall-proximity-scale", type=float, default=None,
+        help="Override RacingEnv.REWARD_WALL_PROXIMITY_SCALE (default 0.5). Higher = more cautious around walls.",
+    )
+    parser.add_argument(
+        "--wall-proximity-margin", type=float, default=None,
+        help="Override RacingEnv.WALL_PROXIMITY_MARGIN in meters (default 0.2). Higher = starts being cautious further from walls.",
+    )
+    parser.add_argument(
+        "--reward-steering-jerk-scale", type=float, default=None,
+        help="Override RacingEnv.REWARD_STEERING_JERK_SCALE (default 0.02). Higher = smoother, less reactive steering.",
+    )
     return parser.parse_args()
 
 
-def make_env():
+def make_env(reward_overrides=None):
     # NOTE: env_simulation keeps its simulator behind a single MODULE-LEVEL
     # singleton (see env_simulation._sim_instance). Two RacingEnv() instances
     # sharing the same Python process would silently stomp on each other's
     # state. Parallelism therefore MUST go through SubprocVecEnv (one
     # process per env, hence one singleton per env) rather than
     # DummyVecEnv/threads whenever n_envs > 1.
-    return Monitor(RacingEnv())
+    env = RacingEnv()
+    for key, value in (reward_overrides or {}).items():
+        setattr(env, key, value)  # instance attribute shadows the class default
+    return Monitor(env)
 
 
 def export_onnx(model: PPO, path: str):
@@ -222,8 +244,22 @@ def export_onnx(model: PPO, path: str):
 def main():
     args = parse_args()
 
+    reward_overrides = {}
+    if args.reward_progress_scale is not None:
+        reward_overrides["REWARD_PROGRESS_SCALE"] = args.reward_progress_scale
+    if args.reward_wall_proximity_scale is not None:
+        reward_overrides["REWARD_WALL_PROXIMITY_SCALE"] = args.reward_wall_proximity_scale
+    if args.wall_proximity_margin is not None:
+        reward_overrides["WALL_PROXIMITY_MARGIN"] = args.wall_proximity_margin
+    if args.reward_steering_jerk_scale is not None:
+        reward_overrides["REWARD_STEERING_JERK_SCALE"] = args.reward_steering_jerk_scale
+    if reward_overrides:
+        print(f"Reward overrides for this run: {reward_overrides}", flush=True)
+
     vec_env_cls = SubprocVecEnv if args.n_envs > 1 else DummyVecEnv
-    env = make_vec_env(make_env, n_envs=args.n_envs, seed=args.seed, vec_env_cls=vec_env_cls)
+    env = make_vec_env(
+        lambda: make_env(reward_overrides), n_envs=args.n_envs, seed=args.seed, vec_env_cls=vec_env_cls
+    )
 
     if args.resume is not None:
         model = PPO.load(args.resume, env=env, device="cpu")
