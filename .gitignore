@@ -13,3 +13,6 @@ logs_*/
 CrashAndLearn-project.pdf
 OldLog/
 License
+
+# Final submitted models ARE source, not training artifacts - keep them
+!submission/**/model.onnx
