@@ -36,7 +36,8 @@ _default_map = os.path.join(_maps_dir, "example_map.yaml") if os.path.exists(_ma
 parser = argparse.ArgumentParser(description="Replay a recorded episode")
 parser.add_argument("--npz", default=None, help="Episode NPZ (default: latest in /app/recordings/)")
 parser.add_argument("--map", default=_default_map, help="Map YAML (auto-detected from episode if available)")
-parser.add_argument("--follow", action="store_true", help="Re-center view on car 0 at each step")
+parser.add_argument("--follow", action="store_true", help="Re-center view on a car at each step (default: car 0, see --follow-car)")
+parser.add_argument("--follow-car", default="0", help="Which car --follow tracks: a team name (e.g. 'driver3') or a 0-based car index (default: 0)")
 parser.add_argument("--no-display", action="store_true",
                     help="Headless: save a PNG snapshot instead of opening a window")
 args = parser.parse_args()
@@ -107,6 +108,16 @@ if "team_names" in ep:
     team_names = [str(name).strip() for name in ep["team_names"]]
 else:
     team_names = [f"Car_{i}" for i in range(num_cars)]
+
+if args.follow:
+    if args.follow_car in team_names:
+        follow_cid = team_names.index(args.follow_car)
+    elif args.follow_car.isdigit() and 0 <= int(args.follow_car) < num_cars:
+        follow_cid = int(args.follow_car)
+    else:
+        sys.exit(f"--follow-car '{args.follow_car}' not found. Available: {team_names} "
+                  f"(or an index 0-{num_cars - 1})")
+    print(f"Following car {follow_cid} ('{team_names[follow_cid]}')")
 
 print(f"  {T} steps, {num_cars} car(s) ({', '.join(team_names)}), sim_dt={sim_dt}s")
 
@@ -266,8 +277,12 @@ def _update(step_i):
         lidar_lc.set_segments([])
 
     if args.follow:
-        ax_map.set_xlim(x0 - half_win, x0 + half_win)
-        ax_map.set_ylim(y0 - half_win, y0 + half_win)
+        # follow_cid resolved once from --follow-car above (lidar rays stay
+        # solo-only - drawing 4 cars' worth of rays would just clutter the view).
+        if status[step_i, follow_cid] == 1 and poses[step_i, follow_cid, 0] < 5000.0:
+            fx, fy, _ = poses[step_i, follow_cid]
+            ax_map.set_xlim(fx - half_win, fx + half_win)
+            ax_map.set_ylim(fy - half_win, fy + half_win)
 
     lines = [f"Step {step_i:<4d}  |  t = {step_i * sim_dt:.2f}s", ""]
 

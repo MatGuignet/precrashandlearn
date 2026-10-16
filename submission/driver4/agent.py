@@ -48,8 +48,8 @@ class Agent:
         self._input_name = self.model.get_inputs()[0].name
 
     def predict(self, obs: dict, info: dict) -> tuple[float, float]:
-        # 1. Preprocess exactly like env.py (features.build_observation)
-        observation = _features.build_observation(obs)
+        # 1. Preprocess exactly like env_champion.py (features.build_observation_multi)
+        observation = _features.build_observation_multi(obs)
 
         # 2. Run ONNX inference
         raw_action = self.model.run(None, {self._input_name: observation[None, :]})[0][0]

@@ -116,14 +116,45 @@ def parse_args():
     parser.add_argument("--eval-freq", type=int, default=100_000)
     parser.add_argument("--gamma", type=float, default=0.999)
     parser.add_argument("--ent-coef", type=float, default=0.005)
+    parser.add_argument(
+        "--reward-progress-scale", type=float, default=None,
+        help="Override RacingEnv.REWARD_PROGRESS_SCALE (per-driver personality fine-tuning)",
+    )
+    parser.add_argument(
+        "--reward-wall-proximity-scale", type=float, default=None,
+        help="Override RacingEnv.REWARD_WALL_PROXIMITY_SCALE",
+    )
+    parser.add_argument(
+        "--wall-proximity-margin", type=float, default=None,
+        help="Override RacingEnv.WALL_PROXIMITY_MARGIN",
+    )
+    parser.add_argument(
+        "--reward-steering-jerk-scale", type=float, default=None,
+        help="Override RacingEnv.REWARD_STEERING_JERK_SCALE",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
+    reward_overrides = {}
+    if args.reward_progress_scale is not None:
+        reward_overrides["REWARD_PROGRESS_SCALE"] = args.reward_progress_scale
+    if args.reward_wall_proximity_scale is not None:
+        reward_overrides["REWARD_WALL_PROXIMITY_SCALE"] = args.reward_wall_proximity_scale
+    if args.wall_proximity_margin is not None:
+        reward_overrides["WALL_PROXIMITY_MARGIN"] = args.wall_proximity_margin
+    if args.reward_steering_jerk_scale is not None:
+        reward_overrides["REWARD_STEERING_JERK_SCALE"] = args.reward_steering_jerk_scale
+    if reward_overrides:
+        print(f"Reward overrides for this run: {reward_overrides}", flush=True)
+
     def make_env():
-        return Monitor(ChampionRacingEnv(opponent_model_path=args.opponent_model))
+        env = ChampionRacingEnv(opponent_model_path=args.opponent_model)
+        for key, value in reward_overrides.items():
+            setattr(env, key, value)
+        return Monitor(env)
 
     vec_env_cls = SubprocVecEnv if args.n_envs > 1 else DummyVecEnv
     env = make_vec_env(make_env, n_envs=args.n_envs, seed=args.seed, vec_env_cls=vec_env_cls)

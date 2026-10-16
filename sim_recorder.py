@@ -23,10 +23,12 @@ parser.add_argument("--laps",           type=int, default=2, help="Target number
 parser.add_argument("--num-cars",       type=int, default=1)
 parser.add_argument("--model",          type=str, default="", help="ONNX model for car 0")
 parser.add_argument("--submissions",    type=str, default="", help="Path to a submission directory or parent directory with team subfolders")
+parser.add_argument("--drivers",        type=str, default="", help="Comma-separated submission/ subfolder names to load explicitly and race together, e.g. 'driver1,driver2,driver3,driver4' or 'champion,driver1,driver2,driver3'. Bypasses --submissions' alphabetical-order team selection; sets --num-cars automatically (capped at 4, the engine limit).")
 parser.add_argument("--controller",     type=str, default="auto", choices=["auto", "submission", "random", "onnx", "pure_pursuit"],
                     help="Controller policy for car 0 (default: auto, uses submission if available)")
 parser.add_argument("--recordings-dir", type=str, default="", help="Directory for saved episodes (default: /app/recordings or recordings/)")
 parser.add_argument("--out",            type=str, default=None, help="Output path (default: <recordings-dir>/episode_XXX.npz)")
+parser.add_argument("--map",            type=str, default="", help="Map to race on, e.g. 'Monza', 'Zandvoort', 'YasMarina', 'Spielberg', 'Shanghai' (default: whatever map is currently active in env_simulation)")
 args = parser.parse_args()
 
 # Determine recordings directory and ensure parent directories exist
@@ -50,6 +52,14 @@ else:
         out_parent = os.path.dirname(args.out)
         if out_parent:
             os.makedirs(out_parent, exist_ok=True)
+
+driver_names = [d.strip() for d in args.drivers.split(",") if d.strip()]
+if driver_names:
+    if len(driver_names) > 4:
+        print(f"[WARNING] {len(driver_names)} names given, engine caps at 4 - "
+              f"using the first 4: {driver_names[:4]}")
+        driver_names = driver_names[:4]
+    args.num_cars = len(driver_names)
 
 num_cars = max(1, min(args.num_cars, 4))
 T = args.steps
@@ -123,36 +133,50 @@ def _onnx_policy(session, obs):
 team_agents = []
 team_names = [f"Car_{i}" for i in range(num_cars)]
 
-from agent_loader import discover_and_load_submissions
+from agent_loader import discover_and_load_submissions, validate_and_load_agent
 
-sub_path = args.submissions.strip()
-if not sub_path and args.controller in ("auto", "submission"):
-    if os.path.exists("submission"):
-        sub_path = "submission"
-
-if sub_path:
+if driver_names:
+    # Explicit, ordered selection (bypasses discover_and_load_submissions'
+    # alphabetical-sort + truncate behavior, which otherwise silently drops
+    # whichever folder sorts last once num_cars < number of submission/ subdirs).
     try:
-        loaded = discover_and_load_submissions(sub_path, max_teams=num_cars)
-        if len(loaded) == 1 and num_cars > 1:
-            # Self-play mode: clone single submission across all cars
-            single_name, single_agent = loaded[0]
-            print(f"Loaded submission '{single_name}' — replicated across {num_cars} cars (self-play)")
-            for i in range(num_cars):
-                team_names[i] = f"{single_name}_{i}"[:10]
-                team_agents.append((team_names[i], single_agent))
-        else:
-            for i in range(num_cars):
-                if i < len(loaded):
-                    tname, tagent = loaded[i]
-                    team_names[i] = tname[:10]
-                    team_agents.append((team_names[i], tagent))
-                    print(f"  [Car {i}] Assigned to Team '{team_names[i]}'")
-                else:
-                    team_agents.append((f"Car_{i}", None))
+        for i, dname in enumerate(driver_names):
+            tname, tagent = validate_and_load_agent(f"submission/{dname}", team_name=dname, unique_id=i)
+            team_names[i] = tname[:10]
+            team_agents.append((team_names[i], tagent))
+            print(f"  [Car {i}] Assigned to Team '{team_names[i]}'")
     except Exception as e:
-        print(f"[ERROR] Failed loading submissions from '{sub_path}':\n{e}")
-        if args.submissions:
-            sys.exit(1)
+        print(f"[ERROR] Failed loading --drivers '{args.drivers}':\n{e}")
+        sys.exit(1)
+else:
+    sub_path = args.submissions.strip()
+    if not sub_path and args.controller in ("auto", "submission"):
+        if os.path.exists("submission"):
+            sub_path = "submission"
+
+    if sub_path:
+        try:
+            loaded = discover_and_load_submissions(sub_path, max_teams=num_cars)
+            if len(loaded) == 1 and num_cars > 1:
+                # Self-play mode: clone single submission across all cars
+                single_name, single_agent = loaded[0]
+                print(f"Loaded submission '{single_name}' — replicated across {num_cars} cars (self-play)")
+                for i in range(num_cars):
+                    team_names[i] = f"{single_name}_{i}"[:10]
+                    team_agents.append((team_names[i], single_agent))
+            else:
+                for i in range(num_cars):
+                    if i < len(loaded):
+                        tname, tagent = loaded[i]
+                        team_names[i] = tname[:10]
+                        team_agents.append((team_names[i], tagent))
+                        print(f"  [Car {i}] Assigned to Team '{team_names[i]}'")
+                    else:
+                        team_agents.append((f"Car_{i}", None))
+        except Exception as e:
+            print(f"[ERROR] Failed loading submissions from '{sub_path}':\n{e}")
+            if args.submissions:
+                sys.exit(1)
 
 session = None
 if args.model:
@@ -165,8 +189,12 @@ if args.model:
 # ---------------------------------------------------------------------------
 from env_simulation import (
     reset, get_obs, apply_action, simulation_step, get_step_info, close, _get_sim,
-    get_current_map,
+    get_current_map, set_map,
 )
+
+if args.map:
+    set_map(args.map, num_cars=num_cars)
+    print(f"Map set to '{args.map}'")
 
 # ---------------------------------------------------------------------------
 # Pre-allocate

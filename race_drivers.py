@@ -1,5 +1,12 @@
-"""race_drivers.py — Validate the 4 differentiated drivers together on the 5
-training circuits (real multi-car races, not a single dummy predict() call).
+"""race_drivers.py — Race any combination of submission/ folders together on the
+5 training circuits (real multi-car races, not a single dummy predict() call).
+
+By default races the 4 solo drivers (Part 2's "Grand Crash Auto" scenario: every
+team member's solo model, simultaneously, no champion). Pass --drivers to race
+any other combination instead, e.g. the champion against some/all drivers:
+    python race_drivers.py --drivers champion,driver1,driver2,driver3
+(the engine caps at 4 cars total - see env_champion.py's MAX_CARS - so at most
+4 names are used regardless of how many are passed).
 
 Runs back-to-back episodes on each of the 5 maps, cycling until a global
 wall-clock time budget is spent, and reports per-driver / per-map finish
@@ -18,21 +25,34 @@ from env_simulation import (
 )
 
 MAPS = ["Monza", "Zandvoort", "YasMarina", "Spielberg", "Shanghai"]
-DRIVER_DIRS = ["submission/driver1", "submission/driver2", "submission/driver3", "submission/driver4"]
+DEFAULT_DRIVERS = ["driver1", "driver2", "driver3", "driver4"]
+MAX_CARS = 4  # engine limit, matches env_champion.py's MAX_CARS
 MAX_STEPS_PER_EPISODE = 6000  # matches env.py's max_episode_steps
 
 
 def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--minutes", type=float, default=30.0)
+    parser.add_argument(
+        "--drivers", type=str, default=",".join(DEFAULT_DRIVERS),
+        help="Comma-separated submission/ subfolder names to race together, e.g. "
+             "'champion,driver1,driver2,driver3'. Capped at 4 (engine limit).",
+    )
     args = parser.parse_args()
+
+    names_requested = [d.strip() for d in args.drivers.split(",") if d.strip()]
+    if len(names_requested) > MAX_CARS:
+        print(f"[WARNING] {len(names_requested)} names given, engine caps at {MAX_CARS} - "
+              f"using the first {MAX_CARS}: {names_requested[:MAX_CARS]}", flush=True)
+        names_requested = names_requested[:MAX_CARS]
 
     budget_s = args.minutes * 60.0
     per_map_budget = budget_s / len(MAPS)
 
     agents = []
-    for i, d in enumerate(DRIVER_DIRS):
-        name, agent = validate_and_load_agent(d, team_name=f"driver{i+1}", unique_id=i)
+    for i, dname in enumerate(names_requested):
+        d = f"submission/{dname}"
+        name, agent = validate_and_load_agent(d, team_name=dname, unique_id=i)
         agents.append((name, agent))
         print(f"Loaded {name} from {d}", flush=True)
 
