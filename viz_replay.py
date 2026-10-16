@@ -36,8 +36,8 @@ _default_map = os.path.join(_maps_dir, "example_map.yaml") if os.path.exists(_ma
 parser = argparse.ArgumentParser(description="Replay a recorded episode")
 parser.add_argument("--npz", default=None, help="Episode NPZ (default: latest in /app/recordings/)")
 parser.add_argument("--map", default=_default_map, help="Map YAML (auto-detected from episode if available)")
-parser.add_argument("--follow", action="store_true", help="Re-center view on a car at each step (default: car 0, see --follow-car)")
-parser.add_argument("--follow-car", default="0", help="Which car --follow tracks: a team name (e.g. 'driver3') or a 0-based car index (default: 0)")
+parser.add_argument("--follow", action="store_true", help="Caméra qui suit une voiture (cf. --follow-car)")
+parser.add_argument("--follow-car", default="0", help="Voiture à suivre : nom (ex: 'driver3') ou index (défaut 0)")
 parser.add_argument("--no-display", action="store_true",
                     help="Headless: save a PNG snapshot instead of opening a window")
 args = parser.parse_args()
@@ -277,8 +277,7 @@ def _update(step_i):
         lidar_lc.set_segments([])
 
     if args.follow:
-        # follow_cid resolved once from --follow-car above (lidar rays stay
-        # solo-only - drawing 4 cars' worth of rays would just clutter the view).
+        # on ne suit que si la voiture est encore en course (sinon pose à 5000+)
         if status[step_i, follow_cid] == 1 and poses[step_i, follow_cid, 0] < 5000.0:
             fx, fy, _ = poses[step_i, follow_cid]
             ax_map.set_xlim(fx - half_win, fx + half_win)

@@ -1,54 +1,10 @@
-"""train.py — PPO training loop for the Crash & Learn solo driving licence (Part 1).
-
-Trains one policy able to loop any of the 5 training circuits (randomly
-reselected every episode by RacingEnv.reset(), under env_simulation's own
-weather/friction/LiDAR-noise randomization) and exports it to model.onnx.
-
-Usage (inside the provided Docker image, which has torch/sb3/onnx installed):
-
-    docker compose run --rm sim python train.py --timesteps 3000000 --n-envs 4
-
-n-envs=4 is a practical ceiling, not a tuning choice: env_simulation's parallel
-envs each run in their own subprocess (see make_env() below), and on a
-Docker Desktop VM capped around 4GB RAM, 8 parallel envs reliably OOM-kill a
-subprocess (confirmed: EOFError from SubprocVecEnv.reset() on 8 envs, clean
-run on 4). Raise it only if the container has more memory available.
-
-Why PPO:
-    - On-policy: each batch of rollouts is collected under whatever
-      friction/map/noise regime env_simulation happens to be sampling at that
-      moment, so there is no stale off-policy replay buffer mixing
-      incompatible dynamics regimes together (unlike SAC/TD3's replay buffer).
-    - Robust default hyperparameters and no target networks / no additional
-      moving parts to destabilize training given a single, deterministic
-      run per team.
-    - Clipped surrogate objective keeps updates conservative, which matters
-      here because the reward already mixes several shaped terms (progress,
-      proximity, jerk, collisions) — large policy updates on a multi-term
-      reward are a common source of degenerate "loophole" policies.
-
-IMPORTANT — no VecNormalize:
-    env.py already hand-normalizes every observation component into a small,
-    fixed range (see features.py). Wrapping the env in SB3's VecNormalize
-    would additionally track running mean/std statistics that are needed at
-    inference time too — but agent.py has no access to that running state
-    (it only loads model.onnx). Using VecNormalize here would train a policy
-    that looks fine in training curves and then silently degrades at
-    tournament time, exactly the drift failure mode the subject warns about.
-"""
-
 import argparse
 import os
 import sys
 
-# The repo ships a folder literally named "gym/" at its root (the f110_gym
-# engine, added to PYTHONPATH by the Dockerfile). Since the working
-# directory is on sys.path, a bare `import gym` resolves to that folder as
-# an empty namespace package instead of raising ImportError — which crashes
-# stable_baselines3's model.save() (it does `import gym as openai_gym` for
-# version reporting and doesn't guard against a "gym" with no __version__).
-# Pre-seeding sys.modules with gymnasium under the "gym" name avoids the
-# collision; it must happen before stable_baselines3 is imported.
+# Le dossier gym/ à la racine (moteur f110) fait que `import gym` tombe dessus
+# au lieu de lever une ImportError, et ça casse model.save() de sb3.
+# On force "gym" -> gymnasium, AVANT d'importer stable_baselines3.
 import gymnasium
 
 sys.modules.setdefault("gym", gymnasium)
@@ -64,18 +20,12 @@ from env import RacingEnv
 
 
 class BestModelCallback(BaseCallback):
-    """Track and save the best-performing checkpoint across training.
+    """Garde le meilleur modèle vu pendant l'entraînement (best_model.zip).
 
-    PPO fine-tuning over many millions of steps does NOT improve
-    monotonically: two long unsupervised runs this project drifted from a
-    genuinely good multi-map policy into a much worse one (collisions and
-    stalls reappearing on some maps) well before total_timesteps was
-    reached, and only manual post-hoc bisection through CheckpointCallback's
-    snapshots recovered the good state. This automates that safety net: every
-    `eval_freq` steps, run one deterministic rollout per training map (the
-    same check used throughout this project's debugging) and keep the
-    highest-scoring snapshot as `best_model.zip`, independent of whatever
-    state training happens to be in when it eventually stops.
+    PPO ne s'améliore pas en continu : sur deux longs runs le modèle était bon
+    puis s'est dégradé (collisions qui reviennent), et j'ai dû retrouver le bon
+    checkpoint à la main. Ici on évalue tous les eval_freq steps sur les 5 maps
+    et on garde le meilleur score.
     """
 
     def __init__(self, eval_freq: int, save_path: str, verbose: int = 1):
@@ -118,9 +68,8 @@ class BestModelCallback(BaseCallback):
             total_wall_hits += wall_hits
 
         avg_progress = total_progress / len(self._eval_env.MAPS)
-        # Finishing a map dominates the score; collisions are a tie-breaking
-        # penalty. Weights are deliberately coarse - this only needs to rank
-        # snapshots relative to each other, not produce a calibrated metric.
+        # finir une map compte le plus, les collisions départagent.
+        # Poids au pif, ça sert juste à comparer les checkpoints entre eux.
         score = finished * 100 + avg_progress * 10 - total_wall_hits * 0.1
 
         print(
@@ -139,76 +88,61 @@ class BestModelCallback(BaseCallback):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the Part-1 solo racing PPO agent")
-    parser.add_argument("--timesteps", type=int, default=3_000_000, help="Total training timesteps")
-    parser.add_argument("--n-envs", type=int, default=4, help="Parallel environments (see module docstring: 4 is the observed RAM ceiling)")
-    parser.add_argument("--logdir", type=str, default="logs", help="TensorBoard + checkpoint directory")
-    parser.add_argument("--out", type=str, default="model.onnx", help="Output ONNX path")
+    parser.add_argument("--timesteps", type=int, default=3_000_000, help="Nombre total de timesteps")
+    parser.add_argument("--n-envs", type=int, default=4, help="Nb d'envs en parallèle (4 max sinon OOM sous Docker)")
+    parser.add_argument("--logdir", type=str, default="logs", help="Dossier TensorBoard + checkpoints")
+    parser.add_argument("--out", type=str, default="model.onnx", help="Chemin du .onnx exporté")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--resume", type=str, default=None, help="Path to a .zip checkpoint to resume from")
+    parser.add_argument("--resume", type=str, default=None, help="Checkpoint .zip à reprendre")
     parser.add_argument(
         "--eval-freq", type=int, default=100_000,
-        help="Timesteps between BestModelCallback evaluations (5-map deterministic "
-             "rollout). Saves logdir/best_model.zip whenever the score improves, so "
-             "a long run's eventual drift/regression never costs the best state "
-             "actually reached.",
+        help="Timesteps entre deux évals (5 maps). Sauvegarde logdir/best_model.zip "
+             "quand le score s'améliore.",
     )
     parser.add_argument(
         "--gamma", type=float, default=0.999,
-        help="Discount factor. At 20Hz decision rate, gamma=0.99 gives an effective "
-             "horizon of only 1/(1-gamma)=100 steps (5s) - too short to credit a "
-             "~1000+ step lap. 0.999 gives ~1000 steps (50s).",
+        help="Discount. 0.99 = horizon ~100 steps (5s à 20Hz), trop court pour un "
+             "tour de 1000+ steps. 0.999 = ~1000 steps.",
     )
     parser.add_argument(
         "--ent-coef", type=float, default=0.005,
-        help="Entropy coefficient. Investigated as a suspect when training "
-             "collapsed to a 'reverse away from every corner' local optimum, "
-             "but the actual cause was REWARD_DNF being large enough to make "
-             "a failed forward attempt cost more than never attempting one "
-             "(see env.py's REWARD_DNF comment) - 0.005 trains fine once "
-             "that's fixed. Lower this only if std runs away again.",
+        help="Coef d'entropie. 0.005 marche bien (le bug de la voiture qui recule "
+             "venait de REWARD_DNF, pas de ça).",
     )
     parser.add_argument(
         "--reward-progress-scale", type=float, default=None,
-        help="Override RacingEnv.REWARD_PROGRESS_SCALE (default 100.0). Higher "
-             "rewards raw speed/progress more relative to caution - used to give "
-             "the 4 submission drivers distinct personalities without retraining "
-             "from scratch (fine-tune from a shared base instead).",
+        help="Remplace REWARD_PROGRESS_SCALE (défaut 100). Plus haut = plus agressif. "
+             "Sert à donner un style différent aux 4 drivers.",
     )
     parser.add_argument(
         "--reward-wall-proximity-scale", type=float, default=None,
-        help="Override RacingEnv.REWARD_WALL_PROXIMITY_SCALE (default 0.5). Higher = more cautious around walls.",
+        help="Remplace REWARD_WALL_PROXIMITY_SCALE (défaut 0.5). Plus haut = plus prudent près des murs.",
     )
     parser.add_argument(
         "--wall-proximity-margin", type=float, default=None,
-        help="Override RacingEnv.WALL_PROXIMITY_MARGIN in meters (default 0.2). Higher = starts being cautious further from walls.",
+        help="Remplace WALL_PROXIMITY_MARGIN en mètres (défaut 0.2).",
     )
     parser.add_argument(
         "--reward-steering-jerk-scale", type=float, default=None,
-        help="Override RacingEnv.REWARD_STEERING_JERK_SCALE (default 0.02). Higher = smoother, less reactive steering.",
+        help="Remplace REWARD_STEERING_JERK_SCALE (défaut 0.02). Plus haut = conduite plus douce.",
     )
     return parser.parse_args()
 
 
 def make_env(reward_overrides=None):
-    # NOTE: env_simulation keeps its simulator behind a single MODULE-LEVEL
-    # singleton (see env_simulation._sim_instance). Two RacingEnv() instances
-    # sharing the same Python process would silently stomp on each other's
-    # state. Parallelism therefore MUST go through SubprocVecEnv (one
-    # process per env, hence one singleton per env) rather than
-    # DummyVecEnv/threads whenever n_envs > 1.
+    # env_simulation est un singleton au niveau du module, donc 2 envs dans
+    # le même process se marchent dessus -> SubprocVecEnv obligatoire si n_envs > 1
     env = RacingEnv()
     for key, value in (reward_overrides or {}).items():
-        setattr(env, key, value)  # instance attribute shadows the class default
+        setattr(env, key, value)  # écrase la valeur de la classe pour cette instance
     return Monitor(env)
 
 
 def export_onnx(model: PPO, path: str):
-    """Export the trained policy's deterministic action head to ONNX.
+    """Exporte l'action déterministe de la policy en ONNX.
 
-    agent.py runs this exact graph through onnxruntime and clips its output
-    to [-1, 1] itself (features.action_to_physical) — matching the clipping
-    stable_baselines3.BaseAlgorithm.predict() applies outside policy.forward(),
-    which is intentionally NOT baked into this graph.
+    Le clip dans [-1, 1] n'est pas dans le graphe, c'est agent.py qui le fait
+    (features.action_to_physical), comme predict() de sb3.
     """
 
     class OnnxablePolicy(th.nn.Module):
@@ -232,15 +166,14 @@ def export_onnx(model: PPO, path: str):
         output_names=["action"],
         opset_version=17,
         dynamic_axes={"observation": {0: "batch"}, "action": {0: "batch"}},
-        # Force the legacy TorchScript-tracing exporter: the newer
-        # torch.export/dynamo-based exporter (default since torch 2.6+)
-        # cannot symbolically trace SB3's ActorCriticPolicy.forward(), which
-        # constructs a torch.distributions.Normal object internally.
+        # l'exporteur dynamo (défaut depuis torch 2.6) plante sur la policy sb3
+        # à cause du torch.distributions.Normal, donc on reste sur l'ancien
         dynamo=False,
     )
     print(f"Exported ONNX policy to {path}")
 
 
+# usage : docker compose run --rm sim python train.py --timesteps 3000000 --n-envs 4
 def main():
     args = parse_args()
 
@@ -256,6 +189,8 @@ def main():
     if reward_overrides:
         print(f"Reward overrides for this run: {reward_overrides}", flush=True)
 
+    # pas de VecNormalize : l'obs est déjà normalisée dans features.py et
+    # agent.py n'aurait pas les stats mean/std au tournoi
     vec_env_cls = SubprocVecEnv if args.n_envs > 1 else DummyVecEnv
     env = make_vec_env(
         lambda: make_env(reward_overrides), n_envs=args.n_envs, seed=args.seed, vec_env_cls=vec_env_cls
@@ -263,18 +198,12 @@ def main():
 
     if args.resume is not None:
         model = PPO.load(args.resume, env=env, device="cpu")
-        # PPO.load() restores gamma/ent_coef/gae_lambda from the checkpoint
-        # itself, not from this run's CLI args. gamma is baked into the
-        # rollout buffer at _setup_model() time rather than re-read from
-        # self.gamma each rollout, so both must be patched explicitly for a
-        # hyperparameter change to actually take effect on resume.
+        # PPO.load() reprend gamma/ent_coef du checkpoint et ignore les args.
+        # gamma est aussi copié dans le rollout buffer, faut changer les deux.
         model.gamma = args.gamma
         model.rollout_buffer.gamma = args.gamma
         model.ent_coef = args.ent_coef
-        # verbose is also restored from the checkpoint (e.g. pretrain_bc.py
-        # used to save with verbose=0) - force it back on so training
-        # progress is actually visible instead of silently running for
-        # however long total_timesteps needs with zero printed output.
+        # sinon verbose=0 repris du checkpoint et on ne voit rien s'afficher
         model.verbose = 1
         print(f"Resumed with overridden gamma={args.gamma}, ent_coef={args.ent_coef}", flush=True)
     else:
@@ -314,10 +243,8 @@ def main():
 
     model.save(os.path.join(args.logdir, "ppo_racing_final"))
 
-    # The final-step model is NOT necessarily the best one reached (PPO does
-    # not improve monotonically over long runs - see BestModelCallback). Export
-    # whichever is best according to the 5-map eval, falling back to the final
-    # model only if BestModelCallback never ran (e.g. a very short --timesteps).
+    # on exporte le best_model plutôt que le dernier (cf. BestModelCallback),
+    # sauf s'il n'existe pas (run trop court)
     best_model_path = os.path.join(args.logdir, "best_model.zip")
     if os.path.exists(best_model_path):
         print(f"Exporting best_model.zip (score={best_model_callback.best_score:.2f}), "
@@ -325,14 +252,9 @@ def main():
         try:
             export_onnx(PPO.load(best_model_path, device="cpu"), args.out)
         except Exception as e:
-            # Loading a second checkpoint in this same process has, once,
-            # hit a flaky torch lazy-import error unrelated to this script's
-            # own logic (reproduced independent of it, see project notes).
-            # Don't let that crash the whole training run at the very last
-            # step - fall back to exporting the in-memory final model, and
-            # leave best_model.zip on disk to export by hand if it matters:
-            #   python -c "from stable_baselines3 import PPO; ..." (no gym
-            #   namespace workaround in that one-off process).
+            # eu une fois une erreur d'import torch bizarre en rechargeant ici.
+            # Pour pas perdre tout le run, on exporte le modèle final et
+            # best_model.zip reste dispo pour l'exporter à la main.
             print(f"WARNING: could not load/export best_model.zip ({e}). "
                   f"Exporting the final-step model instead; best_model.zip "
                   f"is still on disk at {best_model_path} for manual export.", flush=True)

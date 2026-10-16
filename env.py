@@ -7,18 +7,8 @@ import features
 
 
 class RacingEnv(gym.Env):
-    """
-    Gymnasium environment for the Crash & Learn racing simulation.
-
-    Part 1:
-    - One car only
-    - Randomly selects one of the five training maps at reset
-    - Observation: 103 values
-        * 100 LiDAR values
-        * velocity
-        * steering
-        * progress
-    - Normalized observation and action spaces
+    """Env gymnasium pour la partie 1 : une seule voiture, map tirée au hasard
+    parmi les 5 à chaque reset. Obs = 100 lidar + vitesse + steering + progress.
     """
 
     metadata = {"render_modes": []}
@@ -31,62 +21,36 @@ class RacingEnv(gym.Env):
         "Shanghai",
     ]
 
-    # Physical constants, single source of truth in features.py (shared with
-    # agent.py at inference time). Re-exposed here as class attributes so
-    # existing code/tests referencing env.LIDAR_MAX etc. keep working.
+    # définies dans features.py, gardées ici pour le code qui fait env.LIDAR_MAX
     LIDAR_MAX = features.LIDAR_MAX
     MIN_SPEED = features.MIN_SPEED
     MAX_SPEED = features.MAX_SPEED
     MAX_STEERING = features.MAX_STEERING
 
-    # ============================================================
-    # REWARD SHAPING CONSTANTS
-    # ============================================================
-    #
-    # Kept as named class attributes (rather than inline magic numbers)
-    # so they're easy to retune independently without touching the reward
-    # logic itself.
-    #
-    REWARD_PROGRESS_SCALE = 100.0       # per unit of normalized lap progress
-    REWARD_TIME_PENALTY = 0.05          # flat cost per decision step
-    REWARD_WALL_COLLISION = 0.5         # per step in contact with a wall
-    REWARD_VEHICLE_COLLISION = 0.5      # per step in contact with another car
-    # Kept small deliberately: this penalty only fires on CHANGE in steering,
-    # so once steering settles on any constant value (including a hard
-    # lock), the penalty drops to exactly 0 forever after — rewarding "never
-    # turn the wheel" regardless of which value it got stuck on. A previous
-    # value of 0.1 was likely strong enough (relative to a still-weak, noisy
-    # progress signal early in training) to make that a genuine local
-    # optimum. Kept nonzero only to still discourage genuine violent zigzag.
-    REWARD_STEERING_JERK_SCALE = 0.02   # per unit of |normalized steering delta|
-    REWARD_LAP_COMPLETE = 20.0          # bonus on completing a lap
-    REWARD_FINISH = 50.0                # bonus on finishing the race
-    # Kept well below REWARD_LAP_COMPLETE/REWARD_FINISH so finishing still
-    # dominates, but deliberately NOT so large that it swamps the modest
-    # progress reward a still-learning policy can bank before an early
-    # failure. An earlier value of 50 here made "attempt and partially
-    # progress, then fail" cost more in expectation than "never attempt to
-    # move" — a strong incentive to freeze/reverse rather than explore.
-    REWARD_DNF = 12.0                   # penalty on stagnation-based DNF / early wall-contact bail-out
+    # Reward. En attributs de classe pour pouvoir les changer depuis
+    # train.py (--reward-*) sans toucher au code.
+    REWARD_PROGRESS_SCALE = 100.0
+    REWARD_TIME_PENALTY = 0.05          # par step
+    REWARD_WALL_COLLISION = 0.5         # par step contre un mur
+    REWARD_VEHICLE_COLLISION = 0.5
+    # était à 0.1 : la voiture apprenait à bloquer le volant (pénalité nulle
+    # si on ne tourne plus). 0.02 suffit pour éviter le zigzag.
+    REWARD_STEERING_JERK_SCALE = 0.02
+    REWARD_LAP_COMPLETE = 20.0
+    REWARD_FINISH = 50.0
+    # était à 50 : essayer d'avancer et se planter coûtait plus cher que rester
+    # sur place, du coup la voiture reculait / ne bougeait plus.
+    REWARD_DNF = 12.0
 
-    # Dense wall-avoidance shaping: below this distance (meters) from the
-    # nearest LiDAR hit, incur a penalty growing linearly to
-    # REWARD_WALL_PROXIMITY_SCALE as the car gets closer to the wall. This
-    # gives a gradient *before* an actual collision happens, instead of
-    # relying only on the sparse REWARD_WALL_COLLISION signal.
-    WALL_PROXIMITY_MARGIN = 0.2         # meters
+    # pénalité qui monte quand on passe sous WALL_PROXIMITY_MARGIN d'un mur,
+    # pour apprendre à les éviter avant de les toucher
+    WALL_PROXIMITY_MARGIN = 0.2         # en m
     REWARD_WALL_PROXIMITY_SCALE = 0.5
 
-    # A wall collision does NOT by itself end the episode in env_simulation:
-    # a car can stay wedged against a wall, accruing REWARD_WALL_COLLISION
-    # every step, until the stagnation detector eventually fires (up to 80
-    # steps / 4s later) and also applies REWARD_DNF on top. That combination
-    # can make a *failed* attempt to drive cost several times more than
-    # never attempting to move in the first place (bail out fast, pay
-    # REWARD_DNF once) — a strong incentive to freeze rather than explore.
-    # Bailing out ourselves after a short streak of continuous wall contact
-    # bounds that downside to roughly the same order as standing still.
-    WALL_CONTACT_DNF_STEPS = 20         # 1s of continuous wall contact @ 20Hz
+    # toucher un mur ne termine pas l'épisode dans env_simulation, la voiture
+    # peut rester collée jusqu'à 4s et prendre la pénalité à chaque step.
+    # On coupe nous-mêmes après 1s de contact.
+    WALL_CONTACT_DNF_STEPS = 20         # 1s à 20Hz
 
     def __init__(self, max_episode_steps=6000):
         super().__init__()
@@ -98,25 +62,9 @@ class RacingEnv(gym.Env):
         self.current_map = None
         self.wall_contact_streak = 0
 
-        # ============================================================
-        # ACTION SPACE
-        # ============================================================
-        #
-        # action[0] = normalized target speed
-        # action[1] = normalized steering
-        #
-        # Both values are in [-1, 1].
-        #
-        # Speed:
-        #   -1 -> -2 m/s
-        #    0 ->  4 m/s
-        #   +1 -> 10 m/s
-        #
-        # Steering:
-        #   -1 -> -0.4189 rad
-        #    0 ->  0 rad
-        #   +1 -> +0.4189 rad
-        #
+        # action = [vitesse, steering] dans [-1, 1]
+        # vitesse : -1 -> -2 m/s, 0 -> 4 m/s, 1 -> 10 m/s
+        # steering : -1 -> -0.4189 rad, 1 -> 0.4189 rad
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
@@ -124,74 +72,22 @@ class RacingEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # ============================================================
-        # OBSERVATION SPACE
-        # ============================================================
-        #
-        # 100 LiDAR values:
-        #   [0, 1]
-        #
-        # velocity:
-        #   [-0.2, 1]
-        #
-        # steering:
-        #   [-1, 1]
-        #
-        # progress:
-        #   [0, 1]
-        #
-        # Bounds live in features.py (single source of truth, shared with
-        # agent.py at inference time).
-        #
+        # bornes dans features.py
         self.observation_space = spaces.Box(
             low=features.OBS_LOW,
             high=features.OBS_HIGH,
             dtype=np.float32,
         )
 
-    # ==================================================================
-    # MAP MANAGEMENT
-    # ==================================================================
-
     def _select_map(self):
-        """
-        Randomly select a training map.
-        """
         return self.np_random.choice(self.MAPS)
 
-    # ==================================================================
-    # OBSERVATION / ACTION PREPROCESSING
-    # ==================================================================
-    #
-    # Delegated to features.py, the pure-numpy module shared with agent.py.
-    # See features.build_observation() and features.action_to_physical().
-
-    # ==================================================================
-    # REWARD
-    # ==================================================================
-
     def _compute_reward(self, step_info, raw_lidar, normalized_steering, forced_dnf=False):
-        """
-        Compute the reward for one simulation decision step.
-
-        Components (see REWARD_* class constants for the exact weights):
-
-            + progress reward               (main objective)
-            - flat time penalty             (discourage crawling)
-            - dense wall-proximity penalty  (anticipate collisions)
-            - wall collision penalty
-            - vehicle collision penalty
-            - steering-jerk penalty         (smooth driving)
-            + lap-complete bonus
-            + finish bonus
-            - DNF penalty (stagnation, or forced_dnf: a wall-contact bail-out)
+        """Reward d'un step. + progress, tour, arrivée / - temps, murs,
+        collisions, à-coups de volant, DNF (forced_dnf = coupé après contact mur).
         """
 
         agent_id = 0
-
-        # --------------------------------------------------------------
-        # Backend information
-        # --------------------------------------------------------------
 
         progress_delta = float(
             step_info["progress_delta"][agent_id]
@@ -216,25 +112,13 @@ class RacingEnv(gym.Env):
         finished = status == 2
         dnf = status == 0 or forced_dnf
 
-        # --------------------------------------------------------------
-        # Steering smoothness (normalized action units, scale-independent
-        # of MAX_STEERING)
-        # --------------------------------------------------------------
-
+        # en unités normalisées
         steering_jerk = abs(
             normalized_steering
             - self.previous_steering
         )
 
-        # --------------------------------------------------------------
-        # Dense wall-proximity shaping
-        # --------------------------------------------------------------
-        #
-        # A sparse collision penalty only fires once contact already
-        # happened. Adding a continuous penalty as the car gets close to
-        # a wall gives the policy an earlier gradient to steer away,
-        # instead of learning to avoid walls purely from crash events.
-        #
+        # 0 au-delà de la marge, puis linéaire jusqu'à REWARD_WALL_PROXIMITY_SCALE au contact
         min_wall_dist = float(np.min(raw_lidar))
 
         proximity_penalty = 0.0
@@ -244,67 +128,38 @@ class RacingEnv(gym.Env):
                 / self.WALL_PROXIMITY_MARGIN
             )
 
-        # --------------------------------------------------------------
-        # Reward
-        # --------------------------------------------------------------
-
         reward = 0.0
 
-        # Main objective: make progress
         reward += self.REWARD_PROGRESS_SCALE * progress_delta
 
-        # Small time penalty
         reward -= self.REWARD_TIME_PENALTY
 
-        # Anticipate walls before actually hitting them
         reward -= proximity_penalty
 
-        # Avoid walls
         if wall_collision:
             reward -= self.REWARD_WALL_COLLISION
 
-        # Avoid other vehicles
         if vehicle_collision:
             reward -= self.REWARD_VEHICLE_COLLISION
 
-        # Encourage smooth steering
         reward -= self.REWARD_STEERING_JERK_SCALE * steering_jerk
 
-        # Lap completed
         if lap_complete:
             reward += self.REWARD_LAP_COMPLETE
 
-        # Race finished
         if finished:
             reward += self.REWARD_FINISH
 
-        # DNF / stagnation
         if dnf:
             reward -= self.REWARD_DNF
 
-        # Store steering for the next step
         self.previous_steering = normalized_steering
 
         return float(reward)
 
-    # ==================================================================
-    # RESET
-    # ==================================================================
-
     def reset(self, *, seed=None, options=None):
-        """
-        Reset the environment.
-
-        Normal behaviour:
-            env.reset()
-            -> randomly selects one of the five maps.
-
-        Forced map:
-            env.reset(options={"map_name": "Monza"})
-            -> forces Monza.
-
-        This is useful for deterministic map-by-map validation while
-        keeping random map selection during training.
+        """Map au hasard, ou forcée avec options={"map_name": "Monza"}
+        (pratique pour tester map par map).
         """
 
         super().reset(seed=seed)
@@ -312,10 +167,6 @@ class RacingEnv(gym.Env):
         self.step_count = 0
         self.previous_steering = 0.0
         self.wall_contact_streak = 0
-
-        # --------------------------------------------------------------
-        # Select map
-        # --------------------------------------------------------------
 
         if options is not None and "map_name" in options:
             selected_map = options["map_name"]
@@ -330,10 +181,6 @@ class RacingEnv(gym.Env):
 
         self.current_map = selected_map
 
-        # --------------------------------------------------------------
-        # Reset backend simulation
-        # --------------------------------------------------------------
-
         env_simulation.set_map(
             selected_map,
             num_cars=1,
@@ -342,10 +189,6 @@ class RacingEnv(gym.Env):
         env_simulation.reset(
             num_cars=1,
         )
-
-        # --------------------------------------------------------------
-        # Initial observation
-        # --------------------------------------------------------------
 
         raw_obs = env_simulation.get_obs(0)
 
@@ -363,23 +206,8 @@ class RacingEnv(gym.Env):
 
         return observation, info
 
-    # ==================================================================
-    # STEP
-    # ==================================================================
-
     def step(self, action):
-        """
-        Execute one RL decision step.
-
-        One call to simulation_step() corresponds to:
-            5 physics steps
-            50 ms
-            20 Hz decision frequency
-        """
-
-        # --------------------------------------------------------------
-        # Convert normalized action to physical action
-        # --------------------------------------------------------------
+        # 1 step = 1 simulation_step() = 5 steps physiques = 50 ms (20 Hz)
 
         normalized_action = np.clip(
             np.asarray(action, dtype=np.float32),
@@ -391,36 +219,21 @@ class RacingEnv(gym.Env):
             normalized_action
         )
 
-        # --------------------------------------------------------------
-        # Send action to backend
-        # --------------------------------------------------------------
-
         env_simulation.apply_action(
             0,
             target_speed,
             steering,
         )
 
-        # --------------------------------------------------------------
-        # Advance simulation
-        # --------------------------------------------------------------
-
         env_simulation.simulation_step()
 
         self.step_count += 1
-
-        # --------------------------------------------------------------
-        # Retrieve backend information
-        # --------------------------------------------------------------
 
         step_info = env_simulation.get_step_info()
 
         raw_obs = env_simulation.get_obs(0)
 
-        # --------------------------------------------------------------
-        # Wall-contact streak (see WALL_CONTACT_DNF_STEPS docstring)
-        # --------------------------------------------------------------
-
+        # contact mur prolongé -> DNF (cf. WALL_CONTACT_DNF_STEPS)
         wall_collision_now = bool(
             step_info["collisions"]["wall"][0]
         )
@@ -432,10 +245,6 @@ class RacingEnv(gym.Env):
 
         forced_dnf = self.wall_contact_streak >= self.WALL_CONTACT_DNF_STEPS
 
-        # --------------------------------------------------------------
-        # Reward
-        # --------------------------------------------------------------
-
         reward = self._compute_reward(
             step_info,
             raw_obs["lidar"],
@@ -443,37 +252,22 @@ class RacingEnv(gym.Env):
             forced_dnf,
         )
 
-        # --------------------------------------------------------------
-        # Observation
-        # --------------------------------------------------------------
-
         observation = features.build_observation(
             raw_obs
         )
-
-        # --------------------------------------------------------------
-        # Termination
-        # --------------------------------------------------------------
 
         status = int(
             step_info["agent_status"][0]
         )
 
-        # Backend:
-        #   0 = DNF
-        #   1 = active
-        #   2 = finished
+        # status : 0 = DNF, 1 = en course, 2 = fini
         terminated = status in (0, 2) or forced_dnf
 
-        # Gymnasium truncation is used for our own timeout.
+        # timeout à nous -> truncated
         truncated = (
             self.step_count >= self.max_episode_steps
             and not terminated
         )
-
-        # --------------------------------------------------------------
-        # Info
-        # --------------------------------------------------------------
 
         info = {
             "map": self.current_map,
@@ -490,20 +284,11 @@ class RacingEnv(gym.Env):
             info,
         )
 
-    # ==================================================================
-    # CLOSE
-    # ==================================================================
-
     def close(self):
-        """
-        Close the backend simulation.
-        """
         env_simulation.close()
 
 
-# ======================================================================
-# MANUAL VALIDATION
-# ======================================================================
+# test rapide : python env.py
 
 if __name__ == "__main__":
 
@@ -518,10 +303,6 @@ if __name__ == "__main__":
         print("=" * 60)
         print(f"MAP: {map_name}")
         print("=" * 60)
-
-        # --------------------------------------------------------------
-        # Force the map through Gymnasium reset options
-        # --------------------------------------------------------------
 
         observation, info = env.reset(
             options={
@@ -550,10 +331,7 @@ if __name__ == "__main__":
             observation.max()
         )
 
-        # --------------------------------------------------------------
-        # Zero action
-        # --------------------------------------------------------------
-
+        # action nulle
         zero_action = np.array(
             [0.0, 0.0],
             dtype=np.float32,
@@ -573,10 +351,7 @@ if __name__ == "__main__":
             f"status={info['status']}"
         )
 
-        # --------------------------------------------------------------
-        # Forward action
-        # --------------------------------------------------------------
-
+        # plein gaz tout droit, la vitesse doit monter
         forward_action = np.array(
             [1.0, 0.0],
             dtype=np.float32,
@@ -610,10 +385,6 @@ if __name__ == "__main__":
             f"velocity_start={velocities[0]:.3f}",
             f"velocity_end={velocities[-1]:.3f}"
         )
-
-        # --------------------------------------------------------------
-        # Validation
-        # --------------------------------------------------------------
 
         assert observation.shape == (103,)
 

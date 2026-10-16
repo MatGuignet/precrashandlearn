@@ -1,31 +1,3 @@
-"""env_champion.py — Part 3 multi-agent training environment.
-
-Part 2's diagnosis established why a Part 1 solo policy can't hold a shared
-circuit: it never observed another car as anything but a wall, and
-REWARD_VEHICLE_COLLISION was structurally inert under num_cars=1. This
-environment fixes both: the ego car (slot 0) is driven by the policy being
-trained, slots 1..(num_cars-1) are driven internally by a frozen reference
-ONNX policy (the Part 1 champion), and the observation now includes the
-opponents field via features.build_observation_multi.
-
-Design choice — frozen opponents, not simultaneous self-play: fully
-simultaneous multi-agent PPO (every car's policy updated together every
-step) is a substantially harder, more unstable learning problem (the
-environment's dynamics keep shifting under every agent as every other agent
-also changes). Treating opponents as environment dynamics driven by a fixed,
-already-competent policy keeps this a standard single-agent RL problem from
-the ego's point of view, which is what the rest of this project's PPO/BC
-infrastructure is built for. The frozen policy is a reasonable stand-in for
-"some other skilled solo driver" - not identical to what other teams will
-field at tournament time, but not required to be: the ego only needs to
-learn "detect nearby cars, avoid/overtake them", which generalizes across
-whatever the opponent actually is.
-
-num_cars is randomized per episode (2..4) - domain randomization over
-*opponent count*, the same principle as Part 1's map/weather randomization,
-so the ego doesn't overfit to always racing against exactly 3 others.
-"""
-
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -36,6 +8,10 @@ import features
 from env import RacingEnv
 
 
+# Env partie 3 : la voiture 0 est celle qu'on entraîne, les autres sont pilotées
+# par un modèle ONNX figé (le solo de la partie 1). Plus simple et plus stable
+# que du self-play où tout le monde apprend en même temps.
+# Nombre de voitures tiré entre 2 et 4 à chaque épisode.
 class ChampionRacingEnv(RacingEnv):
 
     MIN_CARS = 2
@@ -48,9 +24,7 @@ class ChampionRacingEnv(RacingEnv):
 
         super().__init__(max_episode_steps=max_episode_steps)
 
-        # Overwrite the Part 1 (103-dim) observation space with the
-        # opponent-augmented one - everything else about RacingEnv.__init__
-        # (action space, reward constants) is inherited unchanged.
+        # obs de 103 -> 123 (les 20 valeurs adversaires), le reste ne change pas
         self.observation_space = spaces.Box(
             low=np.concatenate([features.OBS_LOW, np.full(20, -1.0, dtype=np.float32)]),
             high=np.concatenate([features.OBS_HIGH, np.full(20, 1.0, dtype=np.float32)]),
@@ -59,8 +33,7 @@ class ChampionRacingEnv(RacingEnv):
 
     def _opponent_action(self, car_id: int) -> tuple[float, float]:
         raw_obs = env_simulation.get_obs(car_id)
-        # Opponents see the plain solo observation (they ARE solo policies) -
-        # only the ego needs the opponent-augmented one.
+        # les adversaires sont des modèles solo -> obs solo
         obs = features.build_observation(raw_obs)
         raw_action = self._opponent_session.run(
             None, {self._opponent_input_name: obs[None, :]}
@@ -68,10 +41,7 @@ class ChampionRacingEnv(RacingEnv):
         return features.action_to_physical(raw_action)
 
     def reset(self, *, seed=None, options=None):
-        # RacingEnv.reset() calls env_simulation.set_map(..., num_cars=1) and
-        # env_simulation.reset(num_cars=1) - both hardcode 1. Re-run the
-        # equivalent logic here with self.num_cars instead of duplicating
-        # RacingEnv.reset()'s full body.
+        # on ne peut pas appeler super().reset(), num_cars=1 est en dur dedans
         gym.Env.reset(self, seed=seed)
 
         self.num_cars = int(self.np_random.integers(self.MIN_CARS, self.MAX_CARS + 1))
@@ -121,9 +91,7 @@ class ChampionRacingEnv(RacingEnv):
         self.wall_contact_streak = self.wall_contact_streak + 1 if wall_collision_now else 0
         forced_dnf = self.wall_contact_streak >= self.WALL_CONTACT_DNF_STEPS
 
-        # Reused verbatim from RacingEnv (Part 1): progress/time/proximity/
-        # collision/jerk/lap/finish/DNF terms. REWARD_VEHICLE_COLLISION is
-        # now actually reachable, since real opponents exist.
+        # même reward que la partie 1, sauf que la collision voiture peut enfin arriver
         reward = self._compute_reward(
             step_info, raw_obs["lidar"], float(normalized_action[1]), forced_dnf,
         )

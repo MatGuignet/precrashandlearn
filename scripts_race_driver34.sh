@@ -1,10 +1,10 @@
 #!/bin/bash
-# Waits for driver2's opponent-aware fine-tune to finish, then runs driver3 and driver4 sequentially.
+# attend que le train de driver2 soit fini puis lance driver3 et driver4 à la suite
 cd "/Users/mathiasguignet/Documents/Epitech/Master/Crash and learn" || exit 1
 
-# Wait until driver2's log file exists AND a crashandlearn container is running (driver2 started)
+# driver2 a démarré
 while [ ! -f /tmp/train_driver2_oa.log ]; do sleep 5; done
-# Wait until no crashandlearn container is running (driver2 finished)
+# plus aucun container -> driver2 fini
 while docker ps --filter "name=crashandlearn" --format "{{.Names}}" | grep -q .; do sleep 5; done
 
 echo "driver2 done, launching driver3" >> /tmp/chain_driver34.log

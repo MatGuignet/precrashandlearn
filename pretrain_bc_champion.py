@@ -1,21 +1,3 @@
-"""pretrain_bc_champion.py — Behavior-cloning warm start for the Part 3 champion.
-
-Same rationale as pretrain_bc.py (Part 1): PPO from a random init reliably
-fails to discover competent driving on its own, so a reactive heuristic
-generates demonstrations to pretrain the network before any RL update runs.
-
-Reuses the exact same Follow-The-Gap heuristic as Part 1 unchanged - it
-already treats any close LiDAR return as an obstacle to steer around,
-including another car's hull, without needing to read the opponents field
-explicitly. The only things that change from Part 1's pretrain_bc.py are:
-the environment (ChampionRacingEnv, opponents driven by the frozen Part 1
-model) and the observation size (123-dim, via features.build_observation_multi).
-
-Usage:
-    docker compose run --rm sim python pretrain_bc_champion.py \\
-        --opponent-model model.onnx --steps 300000 --out logs_bc_champion/bc_pretrained
-"""
-
 import argparse
 import sys
 
@@ -33,10 +15,16 @@ from env_champion import ChampionRacingEnv
 from pretrain_bc import heuristic_action, behavior_clone
 
 
+# Même idée que pretrain_bc.py mais pour le champion : même heuristique
+# (elle voit déjà les autres voitures comme des obstacles dans le lidar),
+# env avec adversaires et obs de 123.
+#
+#   python pretrain_bc_champion.py --opponent-model model.onnx --steps 300000
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Behavior-cloning warm start for the Part 3 champion")
     parser.add_argument("--opponent-model", type=str, required=True,
-                        help="ONNX model driving opponent cars during demo collection")
+                        help="Modèle ONNX des adversaires")
     parser.add_argument("--steps", type=int, default=300_000)
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)

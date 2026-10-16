@@ -1,18 +1,3 @@
-"""race_drivers.py — Race any combination of submission/ folders together on the
-5 training circuits (real multi-car races, not a single dummy predict() call).
-
-By default races the 4 solo drivers (Part 2's "Grand Crash Auto" scenario: every
-team member's solo model, simultaneously, no champion). Pass --drivers to race
-any other combination instead, e.g. the champion against some/all drivers:
-    python race_drivers.py --drivers champion,driver1,driver2,driver3
-(the engine caps at 4 cars total - see env_champion.py's MAX_CARS - so at most
-4 names are used regardless of how many are passed).
-
-Runs back-to-back episodes on each of the 5 maps, cycling until a global
-wall-clock time budget is spent, and reports per-driver / per-map finish
-rate, DNF rate, average progress and collision counts.
-"""
-
 import argparse
 import sys
 import time
@@ -24,10 +9,14 @@ from env_simulation import (
     set_map, reset, get_obs, apply_action, simulation_step, get_step_info, close,
 )
 
+# Fait courir plusieurs submission/ ensemble sur les 5 maps pendant --minutes
+# et affiche les stats (arrivées, DNF, progress, collisions) par driver et par map.
+#   python race_drivers.py --drivers champion,driver1,driver2,driver3
+
 MAPS = ["Monza", "Zandvoort", "YasMarina", "Spielberg", "Shanghai"]
 DEFAULT_DRIVERS = ["driver1", "driver2", "driver3", "driver4"]
-MAX_CARS = 4  # engine limit, matches env_champion.py's MAX_CARS
-MAX_STEPS_PER_EPISODE = 6000  # matches env.py's max_episode_steps
+MAX_CARS = 4  # limite du moteur
+MAX_STEPS_PER_EPISODE = 6000  # comme dans env.py
 
 
 def run():
@@ -35,8 +24,7 @@ def run():
     parser.add_argument("--minutes", type=float, default=30.0)
     parser.add_argument(
         "--drivers", type=str, default=",".join(DEFAULT_DRIVERS),
-        help="Comma-separated submission/ subfolder names to race together, e.g. "
-             "'champion,driver1,driver2,driver3'. Capped at 4 (engine limit).",
+        help="Dossiers de submission/ séparés par des virgules (4 max)",
     )
     args = parser.parse_args()
 

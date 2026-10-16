@@ -1,24 +1,9 @@
-"""train_champion.py — PPO training loop for the Part 3 champion (multi-agent).
-
-Same PPO setup as train.py (Part 1), pointed at ChampionRacingEnv instead of
-RacingEnv: the ego car shares the circuit with 1-3 opponents driven by a
-frozen reference policy (--opponent-model, typically the Part 1 champion),
-and the observation/reward now include real opponent awareness (see
-env_champion.py and Part 2's diagnosis for why this is a structurally
-different problem from Part 1, not a continuation of it).
-
-Usage:
-    docker compose run --rm sim python train_champion.py \\
-        --resume logs_bc_champion/bc_pretrained.zip \\
-        --opponent-model model.onnx --timesteps 3000000 --n-envs 4
-"""
-
 import argparse
 import os
 import sys
 
 import gymnasium
-sys.modules.setdefault("gym", gymnasium)
+sys.modules.setdefault("gym", gymnasium)  # cf. train.py
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, CallbackList
@@ -31,10 +16,8 @@ from train import export_onnx
 
 
 class ChampionBestModelCallback(BaseCallback):
-    """Same safety net as train.py's BestModelCallback (see its docstring),
-    adapted for the multi-car eval: score now also penalizes
-    vehicle-vehicle collisions, since an ego that "finishes" by plowing
-    through opponents is not what Part 3 is asking for.
+    """Comme BestModelCallback de train.py, mais on pénalise aussi les
+    collisions entre voitures (finir en rentrant dans tout le monde ne compte pas).
     """
 
     def __init__(self, opponent_model_path: str, eval_freq: int, save_path: str, verbose: int = 1):
@@ -106,7 +89,7 @@ class ChampionBestModelCallback(BaseCallback):
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the Part-3 multi-agent champion")
     parser.add_argument("--opponent-model", type=str, required=True,
-                        help="ONNX model driving the 1-3 opponent cars each episode")
+                        help="Modèle ONNX qui pilote les adversaires")
     parser.add_argument("--timesteps", type=int, default=3_000_000)
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--logdir", type=str, default="logs_champion")
@@ -118,23 +101,25 @@ def parse_args():
     parser.add_argument("--ent-coef", type=float, default=0.005)
     parser.add_argument(
         "--reward-progress-scale", type=float, default=None,
-        help="Override RacingEnv.REWARD_PROGRESS_SCALE (per-driver personality fine-tuning)",
+        help="Remplace REWARD_PROGRESS_SCALE (style du driver)",
     )
     parser.add_argument(
         "--reward-wall-proximity-scale", type=float, default=None,
-        help="Override RacingEnv.REWARD_WALL_PROXIMITY_SCALE",
+        help="Remplace REWARD_WALL_PROXIMITY_SCALE",
     )
     parser.add_argument(
         "--wall-proximity-margin", type=float, default=None,
-        help="Override RacingEnv.WALL_PROXIMITY_MARGIN",
+        help="Remplace WALL_PROXIMITY_MARGIN",
     )
     parser.add_argument(
         "--reward-steering-jerk-scale", type=float, default=None,
-        help="Override RacingEnv.REWARD_STEERING_JERK_SCALE",
+        help="Remplace REWARD_STEERING_JERK_SCALE",
     )
     return parser.parse_args()
 
 
+# docker compose run --rm sim python train_champion.py \
+#     --resume logs_bc_champion/bc_pretrained.zip --opponent-model model.onnx --timesteps 3000000
 def main():
     args = parse_args()
 

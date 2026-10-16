@@ -1,12 +1,3 @@
-"""agent_champion.py — Part 3 champion tournament inference wrapper.
-
-Same constraints and same collision-avoidance rationale as agent.py (Part 1) -
-see that file's docstring. The only difference: this one builds the
-opponent-augmented 123-dim observation (features.build_observation_multi)
-instead of the 103-dim solo one, since the champion policy was trained with
-opponent awareness.
-"""
-
 import importlib.util
 import os
 

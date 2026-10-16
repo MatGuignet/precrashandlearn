@@ -23,12 +23,12 @@ parser.add_argument("--laps",           type=int, default=2, help="Target number
 parser.add_argument("--num-cars",       type=int, default=1)
 parser.add_argument("--model",          type=str, default="", help="ONNX model for car 0")
 parser.add_argument("--submissions",    type=str, default="", help="Path to a submission directory or parent directory with team subfolders")
-parser.add_argument("--drivers",        type=str, default="", help="Comma-separated submission/ subfolder names to load explicitly and race together, e.g. 'driver1,driver2,driver3,driver4' or 'champion,driver1,driver2,driver3'. Bypasses --submissions' alphabetical-order team selection; sets --num-cars automatically (capped at 4, the engine limit).")
+parser.add_argument("--drivers",        type=str, default="", help="Dossiers de submission/ à faire courir, ex: 'champion,driver1,driver2'. Remplace --submissions et fixe --num-cars (4 max)")
 parser.add_argument("--controller",     type=str, default="auto", choices=["auto", "submission", "random", "onnx", "pure_pursuit"],
                     help="Controller policy for car 0 (default: auto, uses submission if available)")
 parser.add_argument("--recordings-dir", type=str, default="", help="Directory for saved episodes (default: /app/recordings or recordings/)")
 parser.add_argument("--out",            type=str, default=None, help="Output path (default: <recordings-dir>/episode_XXX.npz)")
-parser.add_argument("--map",            type=str, default="", help="Map to race on, e.g. 'Monza', 'Zandvoort', 'YasMarina', 'Spielberg', 'Shanghai' (default: whatever map is currently active in env_simulation)")
+parser.add_argument("--map",            type=str, default="", help="Map à utiliser (Monza, Zandvoort, YasMarina, Spielberg, Shanghai)")
 args = parser.parse_args()
 
 # Determine recordings directory and ensure parent directories exist
@@ -136,9 +136,8 @@ team_names = [f"Car_{i}" for i in range(num_cars)]
 from agent_loader import discover_and_load_submissions, validate_and_load_agent
 
 if driver_names:
-    # Explicit, ordered selection (bypasses discover_and_load_submissions'
-    # alphabetical-sort + truncate behavior, which otherwise silently drops
-    # whichever folder sorts last once num_cars < number of submission/ subdirs).
+    # discover_and_load_submissions trie par ordre alpha et coupe à num_cars,
+    # donc impossible de choisir qui court -> on charge à la main
     try:
         for i, dname in enumerate(driver_names):
             tname, tagent = validate_and_load_agent(f"submission/{dname}", team_name=dname, unique_id=i)

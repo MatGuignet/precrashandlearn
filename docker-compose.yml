@@ -59,12 +59,9 @@ services:
       MPLBACKEND: Agg
     command: python sim_recorder.py --steps 500 --num-cars 1 --out /app/episode.npz
 
-  # --- viz_replay (interactive top-down replay via X11) ---
-  # Requires XQuartz running on the macOS host with "Allow connections from
-  # network clients" enabled (XQuartz > Settings > Security), and
-  # `xhost + 127.0.0.1` run once per XQuartz session. Without DISPLAY reaching
-  # a real X server, viz_replay.py falls back to saving one static PNG instead
-  # of an interactive, playable replay.
+  # --- viz_replay (replay interactif via X11) ---
+  # sur mac : lancer XQuartz, cocher "Allow connections from network clients"
+  # (Settings > Security) puis `xhost + 127.0.0.1`. Sinon ça sort juste un PNG.
   replay:
     build:
       context: .

@@ -1,28 +1,3 @@
-"""
-env_simulation.py — Crash&Learn Grand Prix simulation backend.
-
-Private _Sim singleton wrapping f110_gym.envs.base_classes.Simulator directly
-(NOT F110Env, NOT gym.make). Exposes exactly 7 module-level functions.
-
-LiDAR class-variable trap: RaceCar.scan_simulator is a class-level singleton.
-After every Simulator (re)construction _apply_lidar_override() must be called to
-build the 100-beam scanner and its geometry arrays. Multiple Simulator instances
-in ONE interpreter share these class variables (harmless under SubprocVecEnv process
-isolation; relevant for the eval harness and unit tests that build simulators in sequence).
-
-Wall response: the engine's iTTC STOP does state[3:]=0 on wall contact, which
-clobbers yaw (state[4]) to 0 — a latent engine bug that snaps the heading to
-+x and allows the car to escape. The wrapper neutralises this with a per-sub-
-step FULL-POSE ROLLBACK (restoring x, y, AND yaw from a pre-step snapshot on
-wall contact). Velocity/yaw_rate/slip remain zeroed (correct for a stopped car).
-No speed debuff. No reward penalty. Escape from a head-on wall requires
-reversing (single-track model produces no yaw at v=0).
-Collisions are never penalised and never terminate the episode.
-"""
-
-# ---------------------------------------------------------------------------
-# Repo path — f110_gym package lives one level up from this file's parent
-# ---------------------------------------------------------------------------
 import os
 import warnings
 
@@ -666,10 +641,9 @@ class _Sim:
         #          self._max_progress
         self._update_stagnation_and_dnf()
 
-        # Generate deterministic LiDAR noise once per step (reused by get_obs).
-        # Noise magnitude tracks the current friction on the same sunny->downpour
-        # axis: _FRICTION_HI (1.0, sunny) -> _LIDAR_NOISE_LO, _FRICTION_LO (0.7,
-        # worst downpour) -> _LIDAR_NOISE_HI, linearly in between.
+        # Generate deterministic LiDAR noise once per step (reused by get_obs)
+        # bruit lidar lié à la météo : soleil (friction 1.0) -> _LIDAR_NOISE_LO,
+        # grosse pluie (0.7) -> _LIDAR_NOISE_HI, linéaire entre les deux
         friction_span = _FRICTION_HI - _FRICTION_LO
         weather_t = (_FRICTION_HI - self._friction) / friction_span if friction_span > 0 else 0.0
         weather_t = float(np.clip(weather_t, 0.0, 1.0))
@@ -680,11 +654,8 @@ class _Sim:
     # Friction
     # ------------------------------------------------------------------
     def _update_friction(self) -> None:
-        # FIX C-weather: this used to build `p` and never apply or store it -
-        # self._friction was set once at reset() and never touched again, so
-        # the whole friction-randomization scaffolding below (_FRICTION_LO,
-        # _friction_countdown, _next_friction_steps) was dead code and every
-        # episode silently ran at _FRICTION_HI (sunny) regardless of range.
+        # fix météo : avant, `p` était construit mais jamais appliqué, donc la
+        # friction restait à _FRICTION_HI (beau temps) tout le temps
         self._friction_countdown -= 1
         if self._friction_countdown > 0:
             return

@@ -1,35 +1,3 @@
-"""transfer_champion_init.py — Warm-start the Part 3 champion from the Part 1
-solo model's weights, instead of behavior-cloning a fresh network from a
-generic heuristic.
-
-Why: pretrain_bc_champion.py's BC-from-heuristic approach discards all the
-driving competence the solo model spent ~9M steps acquiring, and rebuilds it
-from a generic Follow-The-Gap imitation on a brand-new network. Diagnostics
-after 1M + 2.1M further RL steps still showed progress capped at 8-16% on
-every map, at a consistent per-map stopping point even with zero collisions
-- consistent with a still-undertrained network giving up at the first
-genuinely hard corner on each track, not an opponent-avoidance failure per
-se (Part 2/3's actual target skill).
-
-The champion's observation is the solo observation (103 dims) plus 20 new
-opponent-slot dims appended at the end (features.build_observation_multi).
-That means the first Linear layer's weight matrix is the ONLY tensor whose
-shape actually differs between the two networks (input width 103 -> 123);
-every other layer matches exactly. Copying the solo weights directly and
-zero-initializing only the 20 new input columns makes the champion, at
-initialization, mathematically IDENTICAL to the solo model (the opponent
-features are multiplied by zero and contribute nothing) - i.e. it starts
-already able to finish/nearly-finish every training map solo, and PPO
-fine-tuning only has to learn to *additionally* react to opponents on top
-of that, rather than re-deriving solo driving competence from scratch.
-
-Usage:
-    docker compose run --rm sim python transfer_champion_init.py \\
-        --solo-model logs_weather/best_model.zip --out logs_champion3/transferred_init
-    docker compose run --rm sim python train_champion.py --resume logs_champion3/transferred_init.zip \\
-        --opponent-model model.onnx --timesteps 2000000 ...
-"""
-
 import argparse
 import sys
 
@@ -43,11 +11,23 @@ from stable_baselines3.common.env_util import make_vec_env
 from env_champion import ChampionRacingEnv
 
 
+# Init du champion à partir des poids du modèle solo au lieu du BC.
+# Avec le BC le champion plafonnait à 8-16% de progress même après 3M steps,
+# on jetait tout ce que le solo avait appris.
+#
+# Seule la 1re couche change de taille (103 -> 123 entrées). On copie les poids
+# du solo et on met à 0 les 20 nouvelles colonnes : au départ le champion conduit
+# exactement comme le solo, et le fine-tune n'a plus qu'à apprendre les adversaires.
+#
+#   python transfer_champion_init.py --solo-model logs_weather/best_model.zip \
+#       --opponent-model model.onnx --out logs_champion3/transferred_init
+#   python train_champion.py --resume logs_champion3/transferred_init.zip ...
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Transfer solo model weights into a champion-shaped network")
-    parser.add_argument("--solo-model", type=str, required=True, help="Path to the Part 1 solo model .zip")
+    parser.add_argument("--solo-model", type=str, required=True, help="Modèle solo (.zip)")
     parser.add_argument("--opponent-model", type=str, required=True,
-                        help="ONNX model for opponents (only used to construct a valid ChampionRacingEnv)")
+                        help="Modèle ONNX adversaire (juste pour construire l'env)")
     parser.add_argument("--gamma", type=float, default=0.999)
     parser.add_argument("--ent-coef", type=float, default=0.005)
     parser.add_argument("--seed", type=int, default=0)
@@ -101,9 +81,7 @@ def main():
             and solo_tensor.shape[0] == champ_tensor.shape[0]
             and solo_tensor.shape[1] == solo_obs_dim
         ):
-            # The one expected mismatch: this layer's input width grew from
-            # 103 to 123. Copy the original 103 columns, zero the 20 new
-            # (opponent-feature) ones so they start fully inert.
+            # la couche d'entrée : on garde les 103 colonnes, les 20 nouvelles à 0
             new_tensor = champ_tensor.clone()
             with th.no_grad():
                 new_tensor[:, :solo_obs_dim] = solo_tensor
